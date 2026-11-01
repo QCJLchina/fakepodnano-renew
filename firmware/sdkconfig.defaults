@@ -1,0 +1,89 @@
+# ============================================================
+# FAKE_POD_NANO sdkconfig.defaults
+# 阶段 0/1：基础硬件验证（屏幕 + I2C）
+# ============================================================
+
+# ---- 目标芯片 ----
+CONFIG_IDF_TARGET="esp32s3"
+
+# ---- Flash：16MB Winbond, QIO ----
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# ---- 自定义分区表 ----
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ---- PSRAM：8MB Octal @ 80MHz ----
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_FETCH_INSTRUCTIONS=y
+CONFIG_SPIRAM_RODATA=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+
+# ---- CPU：240MHz 双核 ----
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
+
+# ---- FreeRTOS ----
+CONFIG_FREERTOS_HZ=1000
+
+# ---- 编译优化 ----
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# ---- 日志 ----
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# ---- 主任务栈 ----
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# ---- 看门狗 ----
+CONFIG_ESP_TASK_WDT_INIT=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+
+# ============================================================
+# mbedtls 修正
+# ============================================================
+# 关闭 "非 AES 密码的 GCM 软件回退"。
+# 该选项默认开启，会要求 mbedtls 提供 mbedtls_gcm_context_soft 类型，
+# 而该类型仅存在于 Espressif 定制分支的 mbedtls 中。
+# 我们使用官方 mbedtls 3.6.x，关闭此选项即可避免编译错误。
+# 本设备不使用非 AES 的 GCM 加密，关闭无功能影响。
+CONFIG_MBEDTLS_GCM_SUPPORT_NON_AES_CIPHER=n
+
+# ============================================================
+# LVGL V8 高性能配置
+# ============================================================
+CONFIG_LV_COLOR_DEPTH_16=y
+CONFIG_LV_COLOR_16_SWAP=y
+CONFIG_LV_MEM_CUSTOM=y
+CONFIG_LV_MEMCPY_MEMSET_STD=y
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_16=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_FONT_MONTSERRAT_24=y
+CONFIG_LV_FONT_MONTSERRAT_32=y
+
+# ---- 显示时序 / DPI（屏幕：AM200Q460460LK，460x460，2.0"，约 326 PPI）----
+# 刷新周期 16ms ≈ 60Hz 目标（LVGL 默认 30ms 只有 33fps，面板上限是 60Hz）
+CONFIG_LV_DISP_DEF_REFR_PERIOD=16
+# 真实像素密度 ≈ 325.6，LVGL 默认 130 会让控件/字号小 2.5 倍
+CONFIG_LV_DPI_DEF=326
+
+# ============================================================
+# USB UAC 高保真声卡配置 (384kHz / 32-bit 立体声旗舰规格)
+# ============================================================
+CONFIG_UAC_SPEAKER_CHANNEL_NUM=2
+CONFIG_UAC_SAMPLE_RATE=384000
+CONFIG_UAC_BIT_RESOLUTION_32=y
+
+# ============================================================
+# 蓝牙低功耗 (BLE 5.0 NimBLE 时间同步)
+# ============================================================
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_BLE_50_FEATURES_SUPPORTED=y

@@ -1,0 +1,16 @@
+# ============================================================
+# FAKE_POD_NANO 分区表 — 16MB Flash
+# ============================================================
+# 与原固件差异：
+#   原固件 app 各 3MB，spiffs 9.9MB 但完全闲置（音乐走 TF 卡）
+#   新固件：app 扩到 6MB（装 5 个解码器 + LVGL 9 + 字体）
+#          spiffs 缩到 3.8MB（放字体、图片、音效等资源）
+# ============================================================
+# Name,     Type, SubType,  Offset,    Size,      Flags
+nvs,        data, nvs,      0x9000,    0x4000,
+otadata,    data, ota,      0xd000,    0x2000,
+phy_init,   data, phy,      0xf000,    0x1000,
+app0,       app,  ota_0,    0x10000,   0x600000,
+app1,       app,  ota_1,    0x610000,  0x600000,
+coredump,   data, coredump, 0xC10000,  0x10000,
+storage,    data, spiffs,   0xC20000,  0x3E0000,

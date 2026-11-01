@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>FAKE POD NANO - 手机蓝牙无线对时</title>
+  <style>
+    :root {
+      --accent: #ff9f0a;
+      --accent-glow: rgba(255, 159, 10, 0.35);
+      --green: #30d158;
+      --bg: #0d0e12;
+      --card-bg: #18191e;
+      --card-border: rgba(255, 255, 255, 0.08);
+    }
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+    }
+    body {
+      background: var(--bg);
+      color: #f2f2f7;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "PingFang SC", "Segoe UI", Roboto, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 24px 16px 40px;
+    }
+    .container {
+      width: 100%;
+      max-width: 440px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    /* 顶部导航标题 */
+    .header {
+      text-align: center;
+      padding: 12px 0;
+    }
+    .device-title {
+      font-size: 24px;
+      font-weight: 800;
+      letter-spacing: 0.5px;
+      background: linear-gradient(135deg, #fff 40%, var(--accent) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .device-sub {
+      font-size: 13px;
+      color: #8e8e93;
+      margin-top: 4px;
+    }
+
+    /* 核心时间展示大卡片 */
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 24px;
+      padding: 22px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+      position: relative;
+      overflow: hidden;
+    }
+    .time-card {
+      text-align: center;
+      border-color: rgba(255, 159, 10, 0.25);
+      background: radial-gradient(circle at center top, #242018 0%, var(--card-bg) 75%);
+    }
+    .clock-title {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      margin-bottom: 8px;
+    }
+    .clock-time {
+      font-size: 52px;
+      font-weight: 800;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: -1px;
+      line-height: 1.1;
+      color: #ffffff;
+      text-shadow: 0 0 20px rgba(255, 255, 255, 0.15);
+    }
+    .clock-date {
+      font-size: 14px;
+      color: #aeaeb2;
+      margin-top: 6px;
+    }
+    .clock-tz {
+      font-size: 12px;
+      color: #636366;
+      margin-top: 2px;
+    }
+
+    /* 核心操作大按钮 */
+    .btn-sync {
+      width: 100%;
+      height: 64px;
+      border-radius: 20px;
+      border: none;
+      background: linear-gradient(135deg, #ffaa1d, #ff6b00);
+      color: #000;
+      font-size: 18px;
+      font-weight: 800;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      cursor: pointer;
+      box-shadow: 0 6px 25px var(--accent-glow);
+      transition: all 0.2s cubic-bezier(0.18, 0.89, 0.32, 1.28);
+    }
+    .btn-sync:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 10px 32px var(--accent-glow);
+    }
+    .btn-sync:active {
+      transform: scale(0.97);
+    }
+    .btn-sync svg {
+      width: 24px;
+      height: 24px;
+      fill: currentColor;
+    }
+    .btn-sync:disabled {
+      background: #2c2c2e;
+      color: #636366;
+      box-shadow: none;
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    /* 状态指示条 */
+    .status-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 13px;
+      padding: 4px 6px;
+      color: #8e8e93;
+    }
+    .status-dot {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #636366;
+      margin-right: 6px;
+      transition: background 0.3s;
+    }
+    .status-dot.connected {
+      background: var(--green);
+      box-shadow: 0 0 10px rgba(48, 209, 88, 0.6);
+    }
+
+    /* 日志控制台卡片 */
+    .log-box {
+      background: #111216;
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      border-radius: 16px;
+      padding: 12px 14px;
+      height: 150px;
+      overflow-y: auto;
+      font-family: ui-monospace, SFMono-Regular, Consolas, Menlo, monospace;
+      font-size: 11px;
+      line-height: 1.6;
+      color: #8e8e93;
+    }
+    .log-line {
+      margin-bottom: 2px;
+      word-break: break-all;
+    }
+    .log-line.info { color: #0a84ff; }
+    .log-line.success { color: var(--green); font-weight: 700; }
+    .log-line.warn { color: var(--accent); }
+    .log-line.error { color: #ff453a; }
+
+    /* 说明与注意事项卡片 */
+    .note-card {
+      font-size: 12px;
+      color: #636366;
+      line-height: 1.6;
+      background: rgba(255, 255, 255, 0.02);
+      border-radius: 16px;
+      padding: 14px 16px;
+      border: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    .note-card b { color: #aeaeb2; }
+    .note-card ol {
+      padding-left: 18px;
+      margin-top: 6px;
+    }
+    .note-card li { margin-bottom: 4px; }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    <!-- 头部 -->
+    <div class="header">
+      <div class="device-title">FAKE POD NANO</div>
+      <div class="device-sub">手机低功耗蓝牙 (BLE) 高精度无线对时工具</div>
+    </div>
+
+    <!-- 手机本地时间大卡片 -->
+    <div class="card time-card">
+      <div class="clock-title">手机网络标准时间</div>
+      <div class="clock-time" id="clockTime">--:--:--</div>
+      <div class="clock-date" id="clockDate">----年--月--日 星期-</div>
+      <div class="clock-tz" id="clockTz">时区: 本地时区 (UTC+8)</div>
+    </div>
+
+    <!-- 状态指示栏 -->
+    <div class="status-row">
+      <div style="display: flex; align-items: center;">
+        <span class="status-dot" id="statusDot"></span>
+        <span id="statusText">未连接设备</span>
+      </div>
+      <span style="font-size: 12px; color: #636366;" id="macHint">BLE 5.0 Direct</span>
+    </div>
+
+    <!-- 核心一键对时大按钮 -->
+    <button class="btn-sync" id="btnSync" onclick="startBleSync()">
+      <svg viewBox="0 0 24 24"><path d="M11 2v9H2v2h9v9h2v-9h9v-2h-9V2z"/></svg>
+      <span>⚡ 搜索并一键对时</span>
+    </button>
+
+    <!-- 实时交互日志 -->
+    <div class="log-box" id="logBox">
+      <div class="log-line info">[准备就绪] 正在等待点击对时...</div>
+    </div>
+
+    <!-- 部署与使用提示 -->
+    <div class="note-card">
+      <b>💡 使用须知 (针对 Android / ColorOS 17 / Chrome 浏览器)</b>
+      <ol>
+        <li><b>必须使用 HTTPS</b>：根据浏览器安全规范，Web Bluetooth 仅允许在 HTTPS 协议（或 localhost）下调用，请部署在带 SSL 证书的域名或静态托管服务上（如 GitHub Pages、Cloudflare、Vercel 或 NAS 反代）；</li>
+        <li><b>开启手机定位与蓝牙</b>：Android 系统扫描蓝牙设备时需授予浏览器“附近的设备 / 位置”权限；</li>
+        <li><b>保持播放器开机</b>：设备开机会自动发起低功耗蓝牙广播（名称：<code>FAKE_POD_NANO</code>）。</li>
+      </ol>
+    </div>
+  </div>
+
+  <script>
+    /* ============================================================
+     * FAKE_POD_NANO BLE 对时协议定义
+     * ============================================================ */
+    const BLE_SERVICE_UUID = "0000ffe0-0000-1000-8000-00805f9b34fb";
+    const BLE_CHAR_TIME_UUID = "0000ffe1-0000-1000-8000-00805f9b34fb";
+
+    let bluetoothDevice = null;
+
+    // 格式化实时时钟
+    function updateClock() {
+      const now = new Date();
+      const h = String(now.getHours()).padStart(2, '0');
+      const m = String(now.getMinutes()).padStart(2, '0');
+      const s = String(now.getSeconds()).padStart(2, '0');
+      document.getElementById('clockTime').innerText = `${h}:${m}:${s}`;
+
+      const days = ['星期日', '星期一', '星期二', '星期三', '星期四', '星期五', '星期六'];
+      const year = now.getFullYear();
+      const month = String(now.getMonth() + 1).padStart(2, '0');
+      const date = String(now.getDate()).padStart(2, '0');
+      const day = days[now.getDay()];
+      document.getElementById('clockDate').innerText = `${year}年${month}月${date}日 ${day}`;
+
+      const tzOffset = -now.getTimezoneOffset();
+      const tzSign = tzOffset >= 0 ? '+' : '-';
+      const tzHours = Math.floor(Math.abs(tzOffset) / 60);
+      document.getElementById('clockTz').innerText = `时区: UTC${tzSign}${tzHours} (偏移 ${tzOffset} 分钟)`;
+    }
+    setInterval(updateClock, 1000);
+    updateClock();
+
+    function log(msg, type = '') {
+      const box = document.getElementById('logBox');
+      const div = document.createElement('div');
+      div.className = `log-line ${type}`;
+      const now = new Date();
+      const t = String(now.getHours()).padStart(2,'0') + ":" + String(now.getMinutes()).padStart(2,'0') + ":" + String(now.getSeconds()).padStart(2,'0');
+      div.innerText = `[${t}] ${msg}`;
+      box.appendChild(div);
+      box.scrollTop = box.scrollHeight;
+    }
+
+    /* 打包 8 字节高精度时间数据包
+     * [0..3]: Unix 秒级时间戳 (uint32_t LE)
+     * [4..5]: 时区偏移分钟数 (int16_t LE, 如中国为 +480)
+     * [6]:    当前秒的毫秒高位 (uint8_t)
+     * [7]:    校验和 Checksum (前 7 字节累加和低 8 位)
+     */
+    function buildTimePacket() {
+      const now = new Date();
+      const unixSec = Math.floor(now.getTime() / 1000);
+      const tzMinutes = -now.getTimezoneOffset(); // 东八区为 +480
+      const msFrac = Math.floor((now.getTime() % 1000) / 4); // 0..250
+
+      const buffer = new ArrayBuffer(8);
+      const view = new DataView(buffer);
+
+      view.setUint32(0, unixSec, true);    // 小端
+      view.setInt16(4, tzMinutes, true);   // 小端
+      view.setUint8(6, msFrac);
+
+      let checksum = 0;
+      for (let i = 0; i < 7; i++) {
+        checksum = (checksum + view.getUint8(i)) & 0xFF;
+      }
+      view.setUint8(7, checksum);
+
+      return buffer;
+    }
+
+    async function startBleSync() {
+      const btn = document.getElementById('btnSync');
+      const dot = document.getElementById('statusDot');
+      const statusText = document.getElementById('statusText');
+
+      if (!navigator.bluetooth) {
+        log("当前环境不支持 Web Bluetooth！请确认：1. 已使用 HTTPS 访问；2. 使用 Android Chrome/Edge 或支持蓝牙的浏览器。", "error");
+        alert("浏览器未启用蓝牙支持。请使用 HTTPS 访问此网页（如 https://...），并使用支持蓝牙的浏览器。");
+        return;
+      }
+
+      try {
+        btn.disabled = true;
+        statusText.innerText = "正在扫描蓝牙设备...";
+        log("开始搜索周边 BLE 广播设备...", "info");
+
+        // 搜索 FAKE_POD_NANO 或包含该服务的设备
+        bluetoothDevice = await navigator.bluetooth.requestDevice({
+          filters: [
+            { namePrefix: "FAKE_POD" },
+            { namePrefix: "N7" }
+          ],
+          optionalServices: [BLE_SERVICE_UUID]
+        });
+
+        log(`已选中设备: [${bluetoothDevice.name}], 准备建立连接...`, "info");
+        statusText.innerText = `连接中: ${bluetoothDevice.name}...`;
+
+        bluetoothDevice.addEventListener('gattserverdisconnected', onDisconnected);
+
+        // 建立 GATT 连接
+        const server = await bluetoothDevice.gatt.connect();
+        dot.classList.add('connected');
+        statusText.innerText = `已连接: ${bluetoothDevice.name}`;
+        log("GATT 连接成功！正在搜寻时间同步服务 (0xFFE0)...", "info");
+
+        // 获取服务
+        const service = await server.getPrimaryService(BLE_SERVICE_UUID);
+        log("发现对时服务，正在获取时间特征值 (0xFFE1)...", "info");
+
+        // 获取特征值
+        const characteristic = await service.getCharacteristic(BLE_CHAR_TIME_UUID);
+
+        // 打包时间数据
+        const timePacket = buildTimePacket();
+        const now = new Date();
+        log(`正在写入时间包: ${now.toLocaleString()} (时间戳: ${Math.floor(now.getTime()/1000)})...`, "info");
+
+        // 写入数据
+        await characteristic.writeValue(timePacket);
+
+        log(`🎉 对时成功！FAKE_POD_NANO 系统硬件 RTC 已校准到最新网络时间！`, "success");
+        statusText.innerText = "对时完成！";
+
+        // 手机轻微震动反馈
+        if (navigator.vibrate) navigator.vibrate([40, 60, 40]);
+
+        // 延迟 2 秒后优雅断开
+        setTimeout(() => {
+          if (bluetoothDevice && bluetoothDevice.gatt.connected) {
+            log("对时完毕，正在主动释放低功耗蓝牙连接以节省电量...", "info");
+            bluetoothDevice.gatt.disconnect();
+          }
+        }, 2000);
+
+      } catch (err) {
+        log(`操作取消或失败: ${err.message}`, "error");
+        statusText.innerText = "对时失败";
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    function onDisconnected() {
+      const dot = document.getElementById('statusDot');
+      const statusText = document.getElementById('statusText');
+      dot.classList.remove('connected');
+      statusText.innerText = "连接已断开 (就绪)";
+      log("蓝牙连接已正常关闭，播放器已在后台以内部 RTC 持续走时。", "info");
+    }
+  </script>
+</body>
+</html>

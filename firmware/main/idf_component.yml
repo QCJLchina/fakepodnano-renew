@@ -1,0 +1,12 @@
+version: "1.0.0"
+
+dependencies:
+  idf: ">=5.5"
+
+  espressif/esp_lcd_touch:
+    version: "^1.1.2"
+    public: true
+
+  lvgl/lvgl:
+    version: "^8.3.11"
+    public: true

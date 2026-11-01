@@ -1,0 +1,1670 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FAKE_POD_NANO 旗舰交互系统与小屏桌面模式原型</title>
+  <style>
+    :root {
+      --accent: #ff9f0a;
+      --accent-glow: rgba(255, 159, 10, 0.35);
+      --cyan: #00f2fe;
+      --cyan-glow: rgba(0, 242, 254, 0.35);
+      --bg-device: #1c1c1e;
+      --screen-size: 460px;
+      --screen-brightness: 1.0;
+    }
+    * {
+      box-sizing: border-box;
+      user-select: none;
+      -webkit-user-select: none;
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      background: #0d0e12;
+      color: #e5e5ea;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "PingFang SC", "Segoe UI", Roboto, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 20px 16px;
+    }
+
+    /* 顶部全局控制面板 */
+    .top-controls {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 16px;
+      background: rgba(255, 255, 255, 0.06);
+      padding: 8px 16px;
+      border-radius: 999px;
+      backdrop-filter: blur(12px);
+      box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+    .btn-pill {
+      background: #2c2c2e;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      color: #f2f2f7;
+      font-size: 12px;
+      padding: 6px 13px;
+      border-radius: 999px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .btn-pill:hover, .btn-pill.active {
+      background: var(--accent);
+      color: #000;
+      font-weight: 600;
+      border-color: var(--accent);
+      box-shadow: 0 0 12px var(--accent-glow);
+    }
+
+    .ruler-note {
+      font-size: 13px;
+      color: #8e8e93;
+      margin-bottom: 18px;
+      text-align: center;
+      max-width: 680px;
+      line-height: 1.5;
+    }
+    .ruler-note b { color: #fff; }
+    .ruler-note span { color: var(--accent); font-weight: 600; }
+
+    /* 机器本体容器 (模拟 CNC 铝合金外壳) */
+    .device-body {
+      position: relative;
+      background: linear-gradient(145deg, #2c2d30, #18191b);
+      border-radius: 42px;
+      padding: 28px;
+      box-shadow:
+        0 25px 60px rgba(0, 0, 0, 0.8),
+        0 0 0 1px rgba(255, 255, 255, 0.08),
+        inset 0 1px 1px rgba(255, 255, 255, 0.25);
+      transition: transform 0.3s cubic-bezier(0.2, 0.9, 0.3, 1);
+    }
+    .scale-physical {
+      transform: scale(0.35);
+      transform-origin: top center;
+    }
+    .scale-1x { transform: scale(1); }
+
+    /* 侧边两个物理实体微动按键 */
+    .btn-hw {
+      position: absolute;
+      right: -7px;
+      width: 7px;
+      background: linear-gradient(to right, #2a2b2e, #4a4b50);
+      border-radius: 0 4px 4px 0;
+      box-shadow: 2px 0 5px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.2);
+      cursor: pointer;
+      transition: all 0.1s;
+    }
+    .btn-hw:hover {
+      background: var(--accent);
+      box-shadow: 0 0 10px var(--accent-glow);
+    }
+    .btn-hw:active { transform: translateX(-2px); }
+    .btn-hw-power { top: 105px; height: 54px; }
+    .btn-hw-play  { top: 175px; height: 54px; }
+
+    .hw-key-label {
+      position: absolute;
+      right: -140px;
+      font-size: 11px;
+      font-weight: 600;
+      color: #aeaeb2;
+      background: rgba(0,0,0,0.85);
+      padding: 4px 10px;
+      border-radius: 6px;
+      pointer-events: none;
+      white-space: nowrap;
+      border: 1px solid rgba(255,255,255,0.12);
+    }
+    .btn-hw-power .hw-key-label { top: 12px; }
+    .btn-hw-play  .hw-key-label { top: 12px; }
+
+    /* 460x460 AMOLED 正方形屏幕 */
+    .screen {
+      width: var(--screen-size);
+      height: var(--screen-size);
+      background: #000000;
+      border-radius: 20px;
+      overflow: hidden;
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      box-shadow: inset 0 0 4px rgba(255,255,255,0.05);
+      touch-action: none;
+      filter: brightness(var(--screen-brightness));
+      transition: filter 0.1s ease;
+    }
+
+    /* 息屏断电休眠层 */
+    .screen-sleep-overlay {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: #000;
+      z-index: 1000;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.2s ease;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      color: #636366;
+      font-size: 13px;
+    }
+    .screen-sleep-overlay.sleeping {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    /* 浮动单档音量 HUD 胶囊 */
+    .vol-hud {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%) scale(0.85);
+      background: rgba(22, 22, 26, 0.94);
+      border: 1px solid rgba(255, 159, 10, 0.4);
+      padding: 16px 28px;
+      border-radius: 24px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.8), 0 0 25px var(--accent-glow);
+      opacity: 0;
+      pointer-events: none;
+      transition: all 0.2s cubic-bezier(0.18, 0.89, 0.32, 1.28);
+      z-index: 998;
+    }
+    .vol-hud.show {
+      opacity: 1;
+      transform: translate(-50%, -50%) scale(1);
+    }
+    .vol-hud svg {
+      width: 36px;
+      height: 36px;
+      fill: var(--accent);
+    }
+    .vol-hud-text {
+      font-size: 26px;
+      font-weight: 800;
+      color: #fff;
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* 浮动通知 Toast */
+    .toast-msg {
+      position: absolute;
+      top: 50px;
+      left: 50%;
+      transform: translateX(-50%) translateY(-10px);
+      background: rgba(30, 30, 30, 0.95);
+      color: var(--accent);
+      border: 1px solid rgba(255, 159, 10, 0.3);
+      padding: 6px 16px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      opacity: 0;
+      pointer-events: none;
+      transition: all 0.25s ease;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.6);
+      z-index: 999;
+      white-space: nowrap;
+    }
+    .toast-msg.show {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
+    }
+
+    /* 视图页面通用样式 */
+    .view-page {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      padding: 14px 18px;
+      display: flex;
+      flex-direction: column;
+      opacity: 0;
+      pointer-events: none;
+      transform: scale(0.96);
+      transition: opacity 0.22s ease, transform 0.22s ease;
+    }
+    .view-page.active {
+      opacity: 1;
+      pointer-events: auto;
+      transform: scale(1);
+    }
+
+    /* 公共状态栏 (Status Bar) */
+    .status-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      height: 24px;
+      font-size: 12px;
+      color: #8e8e93;
+      margin-bottom: 8px;
+    }
+    .status-bar b { color: #fff; }
+    .status-bar-time {
+      font-weight: 700;
+      color: #fff;
+      font-size: 13px;
+    }
+
+    /* 公共返回导航头 */
+    .nav-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      height: 36px;
+      margin-bottom: 8px;
+    }
+    .btn-nav-back {
+      background: rgba(255, 255, 255, 0.08);
+      border: none;
+      color: var(--accent);
+      font-size: 13px;
+      font-weight: 600;
+      padding: 6px 12px;
+      border-radius: 999px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .btn-nav-back:hover { background: rgba(255, 255, 255, 0.16); }
+    .nav-title {
+      font-size: 17px;
+      font-weight: 700;
+      color: #fff;
+    }
+
+    /* ============================================================
+     * 1. 桌面主页 (Home Launcher - 2x2 宫格大卡片)
+     * ============================================================ */
+    .launcher-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      grid-gap: 14px;
+      height: 380px;
+    }
+    .launcher-card {
+      background: linear-gradient(145deg, #1f2025, #141418);
+      border-radius: 24px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      cursor: pointer;
+      transition: all 0.2s cubic-bezier(0.1, 0.9, 0.2, 1);
+      box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+      position: relative;
+      overflow: hidden;
+    }
+    .launcher-card:hover {
+      transform: translateY(-2px) scale(1.02);
+      border-color: rgba(255, 159, 10, 0.5);
+      box-shadow: 0 10px 30px var(--accent-glow);
+    }
+    .launcher-card:active { transform: scale(0.96); }
+    .card-icon {
+      width: 44px;
+      height: 44px;
+      border-radius: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .card-icon svg { width: 26px; height: 26px; fill: #fff; }
+    .card-title {
+      font-size: 17px;
+      font-weight: 700;
+      color: #fff;
+      margin-top: 8px;
+    }
+    .card-desc {
+      font-size: 12px;
+      color: #8e8e93;
+      line-height: 1.3;
+    }
+
+    /* 各卡片专属色彩 */
+    .card-playing .card-icon { background: linear-gradient(135deg, #ff9f0a, #ff6b00); }
+    .card-files .card-icon   { background: linear-gradient(135deg, #0a84ff, #0055ff); }
+    .card-uac .card-icon     { background: linear-gradient(135deg, #30d158, #00b0ff); }
+    .card-settings .card-icon{ background: linear-gradient(135deg, #bf5af2, #5e5ce6); }
+
+    /* ============================================================
+     * 2. 本地播放页 (Player View)
+     * ============================================================ */
+    .player-page { justify-content: space-between; }
+    .header-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      height: 28px;
+    }
+    .badge-pill {
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--accent);
+      background: rgba(255, 159, 10, 0.12);
+      border: 1px solid rgba(255, 159, 10, 0.28);
+      padding: 3px 10px;
+      border-radius: 999px;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      cursor: pointer;
+    }
+    .cover-section {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      margin: 4px 0;
+    }
+    .album-art-card {
+      width: 196px;
+      height: 196px;
+      border-radius: 24px;
+      overflow: hidden;
+      box-shadow: 0 14px 35px rgba(0, 0, 0, 0.9), 0 0 0 1px rgba(255, 255, 255, 0.12), 0 0 25px var(--accent-glow);
+      cursor: pointer;
+      background: #111;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .album-art-card img { width: 100%; height: 100%; object-fit: cover; }
+
+    .disc-card {
+      width: 196px;
+      height: 196px;
+      border-radius: 50%;
+      background: radial-gradient(circle, #25262a 0%, #151619 65%, #0b0b0d 100%);
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.9), 0 0 0 3px #2c2d33, 0 0 25px var(--accent-glow);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      cursor: pointer;
+    }
+    .disc-card::before {
+      content: "";
+      position: absolute;
+      width: 172px;
+      height: 172px;
+      border-radius: 50%;
+      border: 1px dashed rgba(255, 255, 255, 0.08);
+    }
+    .disc-center {
+      width: 68px;
+      height: 68px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--accent), #ff6b00);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: inset 0 2px 4px rgba(255,255,255,0.4);
+    }
+    .disc-center svg { width: 28px; height: 28px; fill: #000; }
+    .rotating { animation: spin 16s linear infinite; }
+    .paused { animation-play-state: paused; }
+    @keyframes spin { 100% { transform: rotate(360deg); } }
+
+    .track-meta { text-align: center; padding: 0 10px; }
+    .track-title {
+      font-size: 24px;
+      font-weight: 700;
+      color: #ffffff;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      margin-bottom: 4px;
+    }
+    .track-sub {
+      font-size: 14px;
+      color: #8e8e93;
+      display: flex;
+      justify-content: center;
+      gap: 8px;
+    }
+    .progress-wrap { padding: 4px 6px; }
+    .progress-bar-bg {
+      width: 100%;
+      height: 6px;
+      background: #2c2c2e;
+      border-radius: 999px;
+      position: relative;
+      cursor: pointer;
+    }
+    .progress-bar-fill {
+      width: 38%;
+      height: 100%;
+      background: var(--accent);
+      border-radius: 999px;
+      box-shadow: 0 0 8px var(--accent-glow);
+      position: relative;
+    }
+    .progress-bar-fill::after {
+      content: "";
+      position: absolute;
+      right: -6px;
+      top: -5px;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: #fff;
+    }
+    .time-row {
+      display: flex;
+      justify-content: space-between;
+      margin-top: 6px;
+      font-size: 12px;
+      color: #8e8e93;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .controls-row {
+      display: flex;
+      justify-content: space-around;
+      align-items: center;
+      padding-bottom: 4px;
+    }
+    .ctrl-btn {
+      width: 58px;
+      height: 58px;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.08);
+      border: none;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .ctrl-btn:hover { background: rgba(255, 255, 255, 0.18); transform: scale(1.06); }
+    .ctrl-btn:active { transform: scale(0.94); }
+    .ctrl-btn.btn-main {
+      width: 72px;
+      height: 72px;
+      background: var(--accent);
+      color: #000;
+      box-shadow: 0 4px 18px var(--accent-glow);
+    }
+    .ctrl-btn svg { width: 26px; height: 26px; fill: currentColor; }
+    .ctrl-btn.btn-main svg { width: 32px; height: 32px; }
+
+    /* ============================================================
+     * 3. 音乐文件目录页 (支持文件夹层级下潜与回退)
+     * ============================================================ */
+    .file-path-header {
+      font-size: 11px;
+      color: #8e8e93;
+      padding: 0 4px 6px;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .file-path-header b { color: var(--accent); }
+
+    .file-list {
+      flex: 1;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding-right: 4px;
+    }
+    .file-item {
+      background: #18191d;
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      border-radius: 14px;
+      padding: 12px 14px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .file-item:hover, .file-item.active {
+      background: rgba(255, 159, 10, 0.14);
+      border-color: rgba(255, 159, 10, 0.4);
+    }
+    .file-item-icon {
+      width: 34px;
+      height: 34px;
+      border-radius: 9px;
+      background: rgba(255, 255, 255, 0.08);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--accent);
+      font-size: 13px;
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+    .file-item-icon.folder {
+      background: rgba(255, 159, 10, 0.18);
+      color: #ffaa1d;
+    }
+    .file-item-meta { flex: 1; overflow: hidden; }
+    .file-item-name {
+      font-size: 15px;
+      font-weight: 600;
+      color: #fff;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .file-item-sub {
+      font-size: 12px;
+      color: #8e8e93;
+      margin-top: 2px;
+    }
+    .folder-arrow {
+      color: #636366;
+      font-size: 18px;
+      font-weight: 600;
+      padding-right: 4px;
+    }
+    .file-item-name {
+      font-size: 15px;
+      font-weight: 600;
+      color: #fff;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .file-item-sub {
+      font-size: 12px;
+      color: #8e8e93;
+      margin-top: 2px;
+    }
+
+    /* ============================================================
+     * 4. 独立系统设置页 (Settings View)
+     * ============================================================ */
+    .settings-list {
+      flex: 1;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      padding-right: 4px;
+    }
+    .setting-card {
+      background: #18191d;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 18px;
+      padding: 14px 16px;
+    }
+    .setting-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    .setting-title {
+      font-size: 15px;
+      font-weight: 700;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .setting-val {
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--accent);
+    }
+    .setting-slider {
+      width: 100%;
+      height: 8px;
+      background: #2c2c2e;
+      border-radius: 999px;
+      position: relative;
+      cursor: pointer;
+    }
+    .setting-slider-fill {
+      height: 100%;
+      background: var(--accent);
+      border-radius: 999px;
+      position: relative;
+    }
+    .setting-slider-fill::after {
+      content: "";
+      position: absolute;
+      right: -8px;
+      top: -5px;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: #fff;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.5);
+    }
+    .setting-pills-row {
+      display: flex;
+      gap: 8px;
+      margin-top: 8px;
+    }
+    .setting-option-btn {
+      flex: 1;
+      background: #24252a;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      color: #8e8e93;
+      font-size: 12px;
+      padding: 8px 0;
+      border-radius: 10px;
+      cursor: pointer;
+      text-align: center;
+      font-weight: 600;
+    }
+    .setting-option-btn.active {
+      background: var(--accent);
+      color: #000;
+      border-color: var(--accent);
+    }
+
+    /* ============================================================
+     * 5. USB 声卡专属模式 (UAC 384kHz 32bit)
+     * ============================================================ */
+    .uac-page {
+      background: radial-gradient(circle at center top, #141824 0%, #000 70%);
+      align-items: center;
+      text-align: center;
+      justify-content: space-between;
+    }
+    .uac-title-badge {
+      font-size: 11px;
+      font-weight: 700;
+      color: #30d158;
+      background: rgba(48, 209, 88, 0.12);
+      border: 1px solid rgba(48, 209, 88, 0.3);
+      padding: 4px 12px;
+      border-radius: 999px;
+    }
+    .uac-rate-num {
+      font-size: 68px;
+      font-weight: 800;
+      letter-spacing: -2px;
+      line-height: 1;
+      background: linear-gradient(180deg, #ffffff 40%, #00f2fe 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      font-variant-numeric: tabular-nums;
+    }
+    .uac-rate-unit {
+      font-size: 20px;
+      font-weight: 600;
+      color: #00f2fe;
+      margin-left: 4px;
+    }
+    .uac-format-tag {
+      font-size: 14px;
+      font-weight: 500;
+      color: #aeaeb2;
+      margin-top: 4px;
+    }
+    .visualizer-box {
+      width: 100%;
+      height: 70px;
+      display: flex;
+      align-items: flex-end;
+      justify-content: center;
+      gap: 10px;
+      padding: 0 20px;
+    }
+    .vis-bar {
+      width: 16px;
+      background: linear-gradient(to top, #00f2fe, #4facfe, #00c6ff);
+      border-radius: 8px;
+      min-height: 8px;
+      height: 20px;
+      transition: height 0.08s ease;
+      box-shadow: 0 0 10px rgba(0, 242, 254, 0.4);
+    }
+    .uac-footer {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 16px;
+      padding: 10px 16px;
+      width: 100%;
+      display: flex;
+      justify-content: space-between;
+      font-size: 13px;
+      color: #8e8e93;
+    }
+    .uac-footer b { color: #fff; }
+
+    .gesture-hint {
+      position: absolute;
+      bottom: 6px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 60px;
+      height: 4px;
+      background: rgba(255,255,255,0.25);
+      border-radius: 999px;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- 控制与视图切换面板 -->
+  <div class="top-controls">
+    <button class="btn-pill active" onclick="switchView('launcher')">🏠 桌面主页</button>
+    <button class="btn-pill" onclick="switchView('player')">🎵 当前播放</button>
+    <button class="btn-pill" onclick="switchView('files')">📁 播放目录</button>
+    <button class="btn-pill" onclick="switchView('uac')">⚡ USB 声卡</button>
+    <button class="btn-pill" onclick="switchView('settings')">⚙️ 系统设置</button>
+    <span style="width: 1px; height: 18px; background: rgba(255,255,255,0.2);"></span>
+    <button class="btn-pill" onclick="toggleCoverMode()">🖼 封面/黑胶切换</button>
+    <button class="btn-pill" onclick="cycleUacRate()">🎛 切声卡采样率 (最高384k)</button>
+    <span style="width: 1px; height: 18px; background: rgba(255,255,255,0.2);"></span>
+    <button class="btn-pill" onclick="setScale('scale-physical')">🔍 1:1 物理大小 (36mm)</button>
+    <button class="btn-pill" onclick="setScale('scale-1x')">🔎 1x 原始分辨率 (460px)</button>
+  </div>
+
+  <div class="ruler-note">
+    💡 <b>架构更新</b>：已新增 <b>「桌面主页 (Launcher)」</b> 与 <b>「独立系统设置」</b>！
+    在设置中可<b>实时拖拽调节屏幕亮度</b>！各子页面均支持<b>点击左上角或右滑返回桌面</b>。
+  </div>
+
+  <!-- 机器本体 -->
+  <div class="device-body scale-1x" id="deviceBody">
+    <!-- 侧边实体按键 1 (上键：电源/锁屏) -->
+    <div class="btn-hw btn-hw-power" title="侧边电源键 (短按息屏/长按关机)" onclick="onHwKeyPower()" oncontextmenu="onHwKeyPowerLongPress(event)">
+      <div class="hw-key-label">电源键: 短按息屏 / 长按关机</div>
+    </div>
+    <!-- 侧边实体按键 2 (下键：多功能控制) -->
+    <div class="btn-hw btn-hw-play" title="侧边功能键 (短按播放暂停/双击下一曲/长按切模式)" onclick="onHwKeyPlay()" oncontextmenu="onHwKeyPlayLongPress(event)">
+      <div class="hw-key-label">功能键: 播放/双击切歌/长按切页</div>
+    </div>
+
+    <!-- 460x460 AMOLED 正方形屏幕 -->
+    <div class="screen" id="touchScreen">
+      <!-- 息屏模拟层 -->
+      <div class="screen-sleep-overlay" id="sleepOverlay" onclick="onHwKeyPower()">
+        <span style="font-size: 28px; margin-bottom: 8px;">🌙</span>
+        <span style="font-size: 15px; font-weight: 600; color: #fff;">AMOLED 屏幕已息屏休眠</span>
+        <span style="color: var(--accent); margin-top: 6px;">声音仍在后台高保真解码播放</span>
+        <span style="color: #8e8e93; font-size: 11px; margin-top: 4px;">短按侧边电源键随时点亮唤醒</span>
+      </div>
+
+      <!-- 纯单档音量 HUD 浮层 -->
+      <div class="vol-hud" id="volHud">
+        <svg viewBox="0 0 24 24"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>
+        <span class="vol-hud-text" id="volHudText">80%</span>
+      </div>
+
+      <div class="toast-msg" id="toast">提示信息</div>
+
+      <!-- ============================================================
+           视图 0：桌面主页 (Launcher 2x2 宫格大卡片)
+           ============================================================ -->
+      <div class="view-page active" id="pageLauncher">
+        <div class="status-bar">
+          <span class="status-bar-time" id="homeClock">12:30</span>
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <span style="color: var(--accent); font-weight: 700;">CS43131</span>
+            <span id="volDisplayHome">VOL 80%</span>
+            <span>⚡ 95%</span>
+          </div>
+        </div>
+
+        <div class="launcher-grid">
+          <!-- 卡片 1: 当前播放 -->
+          <div class="launcher-card card-playing" onclick="switchView('player')">
+            <div class="card-icon">
+              <svg viewBox="0 0 24 24"><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg>
+            </div>
+            <div>
+              <div class="card-title">正在播放</div>
+              <div class="card-desc" id="homeNowPlayingText">加州旅馆 - Eagles</div>
+            </div>
+          </div>
+
+          <!-- 卡片 2: 音乐目录 -->
+          <div class="launcher-card card-files" onclick="switchView('files')">
+            <div class="card-icon">
+              <svg viewBox="0 0 24 24"><path d="M20 6h-8l-2-2H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm0 12H4V8h16v10z"/></svg>
+            </div>
+            <div>
+              <div class="card-title">音乐目录</div>
+              <div class="card-desc">TF卡 / 专辑 / 无损</div>
+            </div>
+          </div>
+
+          <!-- 卡片 3: USB 声卡模式 -->
+          <div class="launcher-card card-uac" onclick="switchView('uac')">
+            <div class="card-icon">
+              <svg viewBox="0 0 24 24"><path d="M15 2H9c-1.1 0-2 .9-2 2v2H5c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-2V4c0-1.1-.9-2-2-2zm-6 2h6v2H9V4zm10 16H5V8h14v12z"/></svg>
+            </div>
+            <div>
+              <div class="card-title">USB DAC</div>
+              <div class="card-desc">最高 384kHz/32bit</div>
+            </div>
+          </div>
+
+          <!-- 卡片 4: 系统设置 -->
+          <div class="launcher-card card-settings" onclick="switchView('settings')">
+            <div class="card-icon">
+              <svg viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
+            </div>
+            <div>
+              <div class="card-title">系统设置</div>
+              <div class="card-desc">屏幕亮度 / 休眠 / 关于</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="gesture-hint"></div>
+      </div>
+
+      <!-- ============================================================
+           视图 1：主播放器页面 (Player View)
+           ============================================================ -->
+      <div class="view-page player-page" id="pagePlayer">
+        <div class="header-bar">
+          <button class="btn-nav-back" onclick="switchView('launcher')">🏠 桌面</button>
+          <div class="badge-pill" id="trackBadge" onclick="toggleCoverMode()">FLAC 96kHz 24bit</div>
+          <div class="header-icons">
+            <span id="volDisplay">VOL 80%</span>
+          </div>
+        </div>
+
+        <div class="cover-section">
+          <!-- 封面卡片 -->
+          <div class="album-art-card" id="albumArtCard" onclick="toggleCoverMode()">
+            <img id="albumArtImg" src="" alt="Album Art">
+          </div>
+          <!-- 黑胶唱盘 -->
+          <div class="disc-card rotating" id="vinylDisc" onclick="toggleCoverMode()">
+            <div class="disc-center">
+              <svg viewBox="0 0 24 24"><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg>
+            </div>
+          </div>
+        </div>
+
+        <div class="track-meta">
+          <div class="track-title" id="trackTitle">加州旅馆 - Eagles (Live)</div>
+          <div class="track-sub">
+            <span id="trackArtist">Hotel California</span>
+            <span>•</span>
+            <span id="trackRateInfo">96kHz / 24bit</span>
+          </div>
+        </div>
+
+        <div class="progress-wrap">
+          <div class="progress-bar-bg" onclick="seekProgress(event)">
+            <div class="progress-bar-fill" id="progressFill" style="width: 25%;"></div>
+          </div>
+          <div class="time-row">
+            <span id="timeCur">01:45</span>
+            <span id="timeTot">06:30</span>
+          </div>
+        </div>
+
+        <div class="controls-row">
+          <button class="ctrl-btn" onclick="changeTrack(-1)" title="上一曲">
+            <svg viewBox="0 0 24 24"><path d="M6 6h2v12H6zm3.5 6l8.5 6V6z"/></svg>
+          </button>
+          <button class="ctrl-btn btn-main" onclick="togglePlay()" title="播放/暂停" id="btnMainPlay">
+            <svg id="iconMainPlay" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+          </button>
+          <button class="ctrl-btn" onclick="changeTrack(1)" title="下一曲">
+            <svg viewBox="0 0 24 24"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/></svg>
+          </button>
+        </div>
+
+        <div class="gesture-hint"></div>
+      </div>
+
+      <!-- ============================================================
+           视图 2：音乐目录页 (真实多级文件夹层级管理器)
+           ============================================================ -->
+      <div class="view-page" id="pageFiles">
+        <div class="nav-header">
+          <button class="btn-nav-back" id="btnFolderBack" onclick="onFolderBackClick()">🏠 桌面</button>
+          <div class="nav-title" id="folderNavTitle">TF 卡音乐库</div>
+        </div>
+
+        <div class="file-path-header" id="folderPathBreadcrumb">
+          路径: <b>/sdcard</b>
+        </div>
+
+        <div class="file-list" id="fileListContainer">
+          <!-- 动态渲染文件夹与曲目项 -->
+        </div>
+
+        <div class="gesture-hint"></div>
+      </div>
+
+      <!-- ============================================================
+           视图 3：USB 声卡专属模式 (UAC 384kHz 32bit 极客模式)
+           ============================================================ -->
+      <div class="view-page uac-page" id="pageUac">
+        <div class="header-bar" style="width: 100%;">
+          <button class="btn-nav-back" onclick="switchView('launcher')">🏠 桌面</button>
+          <span class="uac-title-badge">USB DAC 384k/32bit</span>
+          <div class="header-icons" style="color: #00f2fe;">
+            <span>CS43131</span>
+          </div>
+        </div>
+
+        <div class="uac-rate-display">
+          <div style="display: flex; align-items: baseline; justify-content: center;">
+            <span class="uac-rate-num" id="uacRateNum">384.0</span>
+            <span class="uac-rate-unit">kHz</span>
+          </div>
+          <div class="uac-format-tag" id="uacFormatTag">32-bit / Dual-Channel MasterHIFI Direct</div>
+        </div>
+
+        <div class="visualizer-box" id="visBox">
+          <div class="vis-bar"></div>
+          <div class="vis-bar"></div>
+          <div class="vis-bar"></div>
+          <div class="vis-bar"></div>
+          <div class="vis-bar"></div>
+          <div class="vis-bar"></div>
+          <div class="vis-bar"></div>
+          <div class="vis-bar"></div>
+        </div>
+
+        <div class="uac-footer">
+          <span>HOST: <b>Windows PC (ASIO/WASAPI)</b></span>
+          <span>FORMAT: <b>32-bit Float/PCM</b></span>
+        </div>
+
+        <div class="gesture-hint"></div>
+      </div>
+
+      <!-- ============================================================
+           视图 4：独立系统设置页 (Settings View)
+           ============================================================ -->
+      <div class="view-page" id="pageSettings">
+        <div class="nav-header">
+          <button class="btn-nav-back" onclick="switchView('launcher')">🏠 桌面</button>
+          <div class="nav-title">系统设置</div>
+        </div>
+
+        <div class="settings-list">
+          <!-- 屏幕固定档位亮度设置卡片 (10, 30, 50, 70, 90, 100) -->
+          <div class="setting-card">
+            <div class="setting-header">
+              <span class="setting-title">☀️ 屏幕亮度 (固定6档)</span>
+              <span class="setting-val" id="valBrightness">70%</span>
+            </div>
+            <div class="setting-pills-row" id="brightnessGroup" style="margin-top: 6px; display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px;">
+              <div class="setting-option-btn" onclick="setBrightnessLevel(this, 10)">10%</div>
+              <div class="setting-option-btn" onclick="setBrightnessLevel(this, 30)">30%</div>
+              <div class="setting-option-btn" onclick="setBrightnessLevel(this, 50)">50%</div>
+              <div class="setting-option-btn active" onclick="setBrightnessLevel(this, 70)">70%</div>
+              <div class="setting-option-btn" onclick="setBrightnessLevel(this, 90)">90%</div>
+              <div class="setting-option-btn" onclick="setBrightnessLevel(this, 100)">100%</div>
+            </div>
+          </div>
+
+          <!-- 时钟同步与设置 (BLE/USB 对时) -->
+          <div class="setting-card">
+            <div class="setting-header">
+              <span class="setting-title">🕒 系统时钟同步</span>
+              <button class="btn-pill" style="padding: 4px 10px; font-size: 11px;" onclick="syncTimeMock()">⚡ 一键对时</button>
+            </div>
+            <div style="font-size: 12px; color: #8e8e93; line-height: 1.5;">
+              方式 1: 手机蓝牙配对自动同步 (Apple CTS / Android)<br>
+              方式 2: Type-C 连接电脑 USB 声卡时静默校准<br>
+              方式 3: 内部 RTC 超低功耗走时（息屏不丢时间）
+            </div>
+          </div>
+
+          <!-- 自动息屏时间 -->
+          <div class="setting-card">
+            <div class="setting-header">
+              <span class="setting-title">⏱ 自动息屏时间</span>
+            </div>
+            <div class="setting-pills-row">
+              <div class="setting-option-btn active" onclick="setSleepTimeout(this, '30s')">30秒</div>
+              <div class="setting-option-btn" onclick="setSleepTimeout(this, '1m')">1分钟</div>
+              <div class="setting-option-btn" onclick="setSleepTimeout(this, '3m')">3分钟</div>
+              <div class="setting-option-btn" onclick="setSleepTimeout(this, 'never')">常亮</div>
+            </div>
+          </div>
+
+          <!-- 防爆耳最大音量锁 -->
+          <div class="setting-card">
+            <div class="setting-header">
+              <span class="setting-title">🛡 防爆耳高音量限额</span>
+              <span class="setting-val">85% 锁</span>
+            </div>
+            <div style="font-size: 12px; color: #8e8e93; margin-top: 2px;">
+              限制单档手势最高调节至 85%，保护听力与耳塞单元
+            </div>
+          </div>
+
+          <!-- 关于设备入口卡片 (点击进入关于详情页) -->
+          <div class="setting-card" style="cursor: pointer; display: flex; justify-content: space-between; align-items: center;" onclick="switchView('about')">
+            <div class="setting-title" style="margin: 0;">ℹ️ 关于</div>
+            <div style="display: flex; align-items: center; gap: 6px;">
+              <span style="font-size: 13px; color: #8e8e93;">FAKE POD NANO</span>
+              <span style="color: #636366; font-size: 18px; font-weight: 600;">›</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="gesture-hint"></div>
+      </div>
+
+      <!-- ============================================================
+           视图 5：关于本设备 (About View)
+           ============================================================ -->
+      <div class="view-page" id="pageAbout">
+        <div class="nav-header">
+          <button class="btn-nav-back" onclick="switchView('settings')">‹ 设置</button>
+          <div class="nav-title">关于本设备</div>
+        </div>
+
+        <div class="settings-list">
+          <!-- 基础信息卡片 -->
+          <div class="setting-card" style="text-align: center; padding: 18px 12px; background: linear-gradient(145deg, #1f2026, #141419); border-color: rgba(255, 159, 10, 0.3);">
+            <div style="font-size: 22px; font-weight: 800; color: #fff; letter-spacing: 0.5px;">FAKE POD NANO</div>
+            <div style="font-size: 13px; color: var(--accent); font-weight: 700; margin-top: 6px; letter-spacing: 0.5px;">软件设计：QCJL</div>
+          </div>
+
+          <!-- 状态信息卡片 -->
+          <div class="setting-card">
+            <div class="setting-header" style="margin-bottom: 8px;">
+              <span class="setting-title" style="font-size: 14px; color: var(--accent);">📊 状态信息</span>
+            </div>
+            <div style="font-size: 13px; color: #aeaeb2; line-height: 1.9;">
+              <div style="display: flex; justify-content: space-between; border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 4px;">
+                <span>主控芯片</span><b style="color: #fff;">ESP32-S3 Dual-Core 240MHz</b>
+              </div>
+              <div style="display: flex; justify-content: space-between; border-bottom: 1px solid rgba(255,255,255,0.05); padding: 4px 0;">
+                <span>存储规格</span><b style="color: #fff;">16MB Flash / 8MB Octal PSRAM</b>
+              </div>
+              <div style="display: flex; justify-content: space-between; border-bottom: 1px solid rgba(255,255,255,0.05); padding: 4px 0;">
+                <span>解码芯片</span><b style="color: #fff;">Cirrus Logic CS43131 MasterHIFI</b>
+              </div>
+              <div style="display: flex; justify-content: space-between; border-bottom: 1px solid rgba(255,255,255,0.05); padding: 4px 0;">
+                <span>显示面板</span><b style="color: #fff;">2.0" AMOLED 460x460 (CO5300)</b>
+              </div>
+              <div style="display: flex; justify-content: space-between; padding-top: 4px;">
+                <span>硬件最高规格</span><b style="color: var(--accent);">384.0 kHz / 32-bit & DSD256</b>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="gesture-hint"></div>
+      </div>
+
+    </div>
+  </div>
+
+  <script>
+    const TRACKS = [
+      {
+        title: "加州旅馆 - Eagles (Live)",
+        artist: "Hotel California",
+        format: "FLAC",
+        rate: "96kHz",
+        bit: "24bit",
+        badge: "FLAC 96k 24bit",
+        dur: 390,
+        coverSvg: `<svg xmlns="http://www.w3.org/2000/svg" width="196" height="196" viewBox="0 0 196 196"><defs><linearGradient id="g1" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#2b5876"/><stop offset="100%" stop-color="#4e4376"/></linearGradient></defs><rect width="196" height="196" fill="url(#g1)"/><circle cx="98" cy="98" r="60" fill="none" stroke="rgba(255,255,255,0.2)" stroke-width="2"/><text x="98" y="92" font-size="16" font-weight="700" fill="#fff" text-anchor="middle" font-family="sans-serif">EAGLES</text><text x="98" y="112" font-size="11" fill="rgba(255,255,255,0.7)" text-anchor="middle" font-family="sans-serif">Hotel California</text></svg>`
+      },
+      {
+        title: "渡口 - 蔡琴",
+        artist: "民歌蔡琴",
+        format: "DSD",
+        rate: "2.822MHz",
+        bit: "1bit DoP",
+        badge: "DSD64 (DoP)",
+        dur: 215,
+        coverSvg: `<svg xmlns="http://www.w3.org/2000/svg" width="196" height="196" viewBox="0 0 196 196"><defs><linearGradient id="g2" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#f857a6"/><stop offset="100%" stop-color="#ff5858"/></linearGradient></defs><rect width="196" height="196" fill="url(#g2)"/><circle cx="98" cy="98" r="50" fill="rgba(0,0,0,0.3)"/><text x="98" y="95" font-size="20" font-weight="bold" fill="#fff" text-anchor="middle" font-family="sans-serif">蔡琴</text><text x="98" y="115" font-size="11" fill="#fff" text-anchor="middle" font-family="sans-serif">渡口 • DSD Master</text></svg>`
+      },
+      {
+        title: "Bohemian Rhapsody",
+        artist: "Queen (A Night at the Opera)",
+        format: "WAV",
+        rate: "384kHz",
+        bit: "32bit",
+        badge: "WAV 384k 32bit",
+        dur: 354,
+        coverSvg: `<svg xmlns="http://www.w3.org/2000/svg" width="196" height="196" viewBox="0 0 196 196"><defs><linearGradient id="g3" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#141E30"/><stop offset="100%" stop-color="#243B55"/></linearGradient></defs><rect width="196" height="196" fill="url(#g3)"/><polygon points="98,40 148,140 48,140" fill="none" stroke="#ff9f0a" stroke-width="3"/><text x="98" y="105" font-size="18" font-weight="bold" fill="#fff" text-anchor="middle" font-family="sans-serif">QUEEN</text></svg>`
+      },
+      {
+        title: "Bad Guy - Billie Eilish",
+        artist: "WHEN WE ALL FALL ASLEEP",
+        format: "AAC",
+        rate: "48kHz",
+        bit: "16bit",
+        badge: "M4A AAC 48k",
+        dur: 194,
+        coverSvg: `<svg xmlns="http://www.w3.org/2000/svg" width="196" height="196" viewBox="0 0 196 196"><rect width="196" height="196" fill="#ffe600"/><rect x="25" y="25" width="146" height="146" fill="#000"/><text x="98" y="105" font-size="18" font-weight="900" fill="#ffe600" text-anchor="middle" font-family="sans-serif">BILLIE</text></svg>`
+      },
+      {
+        title: "晴天 - 周杰伦",
+        artist: "叶惠美",
+        format: "MP3",
+        rate: "44.1kHz",
+        bit: "16bit",
+        badge: "MP3 320kbps",
+        dur: 269,
+        coverSvg: `<svg xmlns="http://www.w3.org/2000/svg" width="196" height="196" viewBox="0 0 196 196"><defs><linearGradient id="g5" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#3a1c71"/><stop offset="50%" stop-color="#d76d77"/><stop offset="100%" stop-color="#ffaf7b"/></linearGradient></defs><rect width="196" height="196" fill="url(#g5)"/><text x="98" y="95" font-size="20" font-weight="bold" fill="#fff" text-anchor="middle" font-family="sans-serif">晴天</text><text x="98" y="115" font-size="12" fill="#fff" text-anchor="middle" font-family="sans-serif">周杰伦 • 叶惠美</text></svg>`
+      }
+    ];
+
+    const UAC_RATES = ["44.1", "48.0", "88.2", "96.0", "176.4", "192.0", "352.8", "384.0"];
+    let currentUacIdx = 7;
+
+    let trackIdx = 0;
+    let isPlaying = true;
+    let playSec = 105;
+    let currentVol = 80;
+    let isCoverMode = true;
+    let isSleeping = false;
+    let volHudTimer = null;
+
+    function showToast(msg) {
+      const t = document.getElementById('toast');
+      t.innerText = msg;
+      t.classList.add('show');
+      setTimeout(() => t.classList.remove('show'), 1600);
+    }
+
+    function showVolHud() {
+      const hud = document.getElementById('volHud');
+      document.getElementById('volHudText').innerText = currentVol + "%";
+      hud.classList.add('show');
+      clearTimeout(volHudTimer);
+      volHudTimer = setTimeout(() => hud.classList.remove('show'), 1200);
+    }
+
+    function updateTrackUI() {
+      const tr = TRACKS[trackIdx];
+      document.getElementById('trackTitle').innerText = tr.title;
+      document.getElementById('trackArtist').innerText = tr.artist;
+      document.getElementById('trackRateInfo').innerText = tr.rate + " / " + tr.bit;
+      document.getElementById('trackBadge').innerText = tr.badge;
+      document.getElementById('timeTot').innerText = formatTime(tr.dur);
+      document.getElementById('timeCur').innerText = formatTime(playSec);
+      document.getElementById('progressFill').style.width = ((playSec / tr.dur) * 100) + "%";
+      document.getElementById('homeNowPlayingText').innerText = tr.title.split('-')[0].trim();
+
+      const svgBase64 = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(tr.coverSvg);
+      document.getElementById('albumArtImg').src = svgBase64;
+    }
+
+    function formatTime(s) {
+      const m = Math.floor(s / 60);
+      const sec = Math.floor(s % 60);
+      return String(m).padStart(2, '0') + ":" + String(sec).padStart(2, '0');
+    }
+
+    function toggleCoverMode() {
+      isCoverMode = !isCoverMode;
+      const card = document.getElementById('albumArtCard');
+      const disc = document.getElementById('vinylDisc');
+      if (isCoverMode) {
+        card.style.display = 'flex';
+        disc.style.display = 'none';
+        showToast("已切换到「专辑封面」模式");
+      } else {
+        card.style.display = 'none';
+        disc.style.display = 'flex';
+        showToast("已切换到「复古黑胶」模式");
+      }
+    }
+
+    function togglePlay() {
+      isPlaying = !isPlaying;
+      const vinyl = document.getElementById('vinylDisc');
+      const icon = document.getElementById('iconMainPlay');
+
+      if (isPlaying) {
+        vinyl.classList.remove('paused');
+        icon.innerHTML = '<path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>';
+        showToast("已恢复播放");
+      } else {
+        vinyl.classList.add('paused');
+        icon.innerHTML = '<path d="M8 5v14l11-7z"/>';
+        showToast("已暂停播放");
+      }
+    }
+
+    function changeTrack(delta) {
+      trackIdx = (trackIdx + delta + TRACKS.length) % TRACKS.length;
+      playSec = 0;
+      updateTrackUI();
+      renderFileList();
+      showToast("切歌: " + TRACKS[trackIdx].title.split('-')[0].trim());
+    }
+
+    function seekProgress(e) {
+      const rect = e.currentTarget.getBoundingClientRect();
+      const pos = (e.clientX - rect.left) / rect.width;
+      playSec = Math.floor(pos * TRACKS[trackIdx].dur);
+      updateTrackUI();
+    }
+
+    /* 页面路由切换 */
+    function switchView(viewName) {
+      document.querySelectorAll('.view-page').forEach(p => p.classList.remove('active'));
+      const target = document.getElementById('page' + viewName.charAt(0).toUpperCase() + viewName.slice(1));
+      if (target) target.classList.add('active');
+
+      document.querySelectorAll('.btn-pill').forEach(b => b.classList.remove('active'));
+      const matchBtn = Array.from(document.querySelectorAll('.btn-pill')).find(b => b.getAttribute('onclick') && b.getAttribute('onclick').includes(viewName));
+      if (matchBtn) matchBtn.classList.add('active');
+    }
+
+    function cycleUacRate() {
+      currentUacIdx = (currentUacIdx + 1) % UAC_RATES.length;
+      const r = UAC_RATES[currentUacIdx];
+      document.getElementById('uacRateNum').innerText = r;
+      showToast("Windows 采样率切换: " + r + " kHz");
+      switchView('uac');
+    }
+
+    function setScale(cls) {
+      const el = document.getElementById('deviceBody');
+      el.className = 'device-body ' + cls;
+      if (cls === 'scale-physical') {
+        showToast("已切换为 1:1 物理大小 (36mm)");
+      } else {
+        showToast("已切换为 1x 原始分辨率");
+      }
+    }
+
+    /* 侧边物理按键 */
+    function onHwKeyPower() {
+      isSleeping = !isSleeping;
+      const overlay = document.getElementById('sleepOverlay');
+      if (isSleeping) {
+        overlay.classList.add('sleeping');
+        showToast("🌙 屏幕已息屏休眠 (声音继续流淌)");
+      } else {
+        overlay.classList.remove('sleeping');
+        showToast("☀️ 屏幕已唤醒点亮");
+      }
+    }
+
+    function onHwKeyPowerLongPress(e) {
+      e.preventDefault();
+      showToast("⚠️ 电源键长按: 触发关机 Deep Sleep");
+    }
+
+    let lastPlayClick = 0;
+    function onHwKeyPlay() {
+      const now = Date.now();
+      if (now - lastPlayClick < 350) {
+        changeTrack(1);
+        lastPlayClick = 0;
+        return;
+      }
+      lastPlayClick = now;
+      setTimeout(() => {
+        if (lastPlayClick !== 0) {
+          togglePlay();
+          lastPlayClick = 0;
+        }
+      }, 360);
+    }
+
+    function onHwKeyPlayLongPress(e) {
+      e.preventDefault();
+      const isUac = document.getElementById('pageUac').classList.contains('active');
+      switchView(isUac ? 'launcher' : 'uac');
+      showToast("🔄 功能键长按: 切换页面");
+    }
+
+    /* 纯单档音量步进调节 */
+    function stepVolume(delta) {
+      currentVol = Math.max(0, Math.min(100, currentVol + delta));
+      document.getElementById('volDisplay').innerText = "VOL " + currentVol + "%";
+      document.getElementById('volDisplayHome').innerText = "VOL " + currentVol + "%";
+      showVolHud();
+    }
+
+    /* 屏幕滑动手势 */
+    let startX = 0, startY = 0;
+    const screen = document.getElementById('touchScreen');
+    screen.addEventListener('pointerdown', (e) => {
+      startX = e.clientX;
+      startY = e.clientY;
+    });
+    screen.addEventListener('pointerup', (e) => {
+      const diffX = e.clientX - startX;
+      const diffY = e.clientY - startY;
+
+      if (Math.abs(diffX) > Math.abs(diffY)) {
+        if (diffX > 55) {
+          // 智能右划返回：
+          const isAbout = document.getElementById('pageAbout').classList.contains('active');
+          const isFiles = document.getElementById('pageFiles').classList.contains('active');
+
+          if (isAbout) {
+            switchView('settings');
+          } else if (isFiles && dirStack.length > 1) {
+            onFolderBackClick();
+          } else {
+            const isHome = document.getElementById('pageLauncher').classList.contains('active');
+            if (!isHome) {
+              switchView('launcher');
+            } else {
+              changeTrack(-1);
+            }
+          }
+        } else if (diffX < -55) {
+          changeTrack(1);
+        }
+      } else {
+        // 上下滑动调节音量：严格限定只在主播放页 (pagePlayer) 生效！其他页面执行正常垂直滚动！
+        const isPlayer = document.getElementById('pagePlayer').classList.contains('active');
+        if (isPlayer) {
+          if (diffY < -35) {
+            stepVolume(5);
+          } else if (diffY > 35) {
+            stepVolume(-5);
+          }
+        }
+      }
+    });
+
+    /* 屏幕固定 6 档亮度调节 (10, 30, 50, 70, 90, 100) */
+    function setBrightnessLevel(btn, percent) {
+      document.querySelectorAll('#brightnessGroup .setting-option-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      document.getElementById('valBrightness').innerText = percent + "%";
+      // 模拟 AMOLED 屏幕明暗反馈 (0.35 ~ 1.0)
+      const factor = 0.35 + (percent / 100) * 0.65;
+      document.documentElement.style.setProperty('--screen-brightness', factor);
+      showToast("AMOLED 亮度切换为: " + percent + "%");
+    }
+
+    function setSleepTimeout(btn, val) {
+      document.querySelectorAll('.setting-option-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      showToast("自动息屏时间设置为: " + val);
+    }
+
+    function syncTimeMock() {
+      const d = new Date();
+      const timeStr = String(d.getHours()).padStart(2, '0') + ":" + String(d.getMinutes()).padStart(2, '0');
+      document.getElementById('homeClock').innerText = timeStr;
+      showToast("✅ 已通过手机 BLE 同步网络时间: " + timeStr);
+    }
+
+    /* -------------------------------------------------------------
+     * 真实多级文件夹文件系统模型 (Folder Tree File System)
+     * ------------------------------------------------------------- */
+    const FS_ROOT = {
+      name: "TF卡根目录",
+      path: "/sdcard",
+      folders: [
+        {
+          name: "周杰伦 - 经典无损合集",
+          path: "/sdcard/周杰伦 - 经典无损合集",
+          folders: [
+            {
+              name: "范特西 (2001)",
+              path: "/sdcard/周杰伦 - 经典无损合集/范特西 (2001)",
+              folders: [],
+              files: [
+                {
+                  title: "01. 爱在西元前",
+                  artist: "周杰伦 • 范特西",
+                  format: "FLAC",
+                  rate: "96kHz",
+                  bit: "24bit",
+                  badge: "FLAC 96k 24bit",
+                  dur: 230,
+                  coverSvg: `<svg xmlns="http://www.w3.org/2000/svg" width="196" height="196" viewBox="0 0 196 196"><rect width="196" height="196" fill="#800000"/><text x="98" y="105" font-size="20" font-weight="bold" fill="#fff" text-anchor="middle" font-family="sans-serif">范特西</text></svg>`
+                },
+                {
+                  title: "02. 简单爱",
+                  artist: "周杰伦 • 范特西",
+                  format: "FLAC",
+                  rate: "96kHz",
+                  bit: "24bit",
+                  badge: "FLAC 96k 24bit",
+                  dur: 271,
+                  coverSvg: `<svg xmlns="http://www.w3.org/2000/svg" width="196" height="196" viewBox="0 0 196 196"><rect width="196" height="196" fill="#990000"/><text x="98" y="105" font-size="20" font-weight="bold" fill="#fff" text-anchor="middle" font-family="sans-serif">简单爱</text></svg>`
+                }
+              ]
+            },
+            {
+              name: "叶惠美 (2003)",
+              path: "/sdcard/周杰伦 - 经典无损合集/叶惠美 (2003)",
+              folders: [],
+              files: [
+                {
+                  title: "01. 晴天",
+                  artist: "周杰伦 • 叶惠美",
+                  format: "MP3",
+                  rate: "44.1kHz",
+                  bit: "16bit",
+                  badge: "MP3 320kbps",
+                  dur: 269,
+                  coverSvg: TRACKS[4].coverSvg
+                },
+                {
+                  title: "02. 以父之名",
+                  artist: "周杰伦 • 叶惠美",
+                  format: "FLAC",
+                  rate: "96kHz",
+                  bit: "24bit",
+                  badge: "FLAC 96k 24bit",
+                  dur: 342,
+                  coverSvg: `<svg xmlns="http://www.w3.org/2000/svg" width="196" height="196" viewBox="0 0 196 196"><rect width="196" height="196" fill="#111"/><text x="98" y="105" font-size="18" font-weight="bold" fill="#ff9f0a" text-anchor="middle" font-family="sans-serif">以父之名</text></svg>`
+                }
+              ]
+            }
+          ],
+          files: []
+        },
+        {
+          name: "DSD 母带高解析专区",
+          path: "/sdcard/DSD 母带高解析专区",
+          folders: [],
+          files: [
+            {
+              title: "渡口 - 蔡琴",
+              artist: "民歌蔡琴 • DSD Direct",
+              format: "DSD",
+              rate: "2.822MHz",
+              bit: "1bit DoP",
+              badge: "DSD64 (DoP)",
+              dur: 215,
+              coverSvg: TRACKS[1].coverSvg
+            },
+            {
+              title: "被遗忘的时光 - 蔡琴",
+              artist: "民歌蔡琴 • DSD Master",
+              format: "DSD",
+              rate: "2.822MHz",
+              bit: "1bit DoP",
+              badge: "DSD64 (DoP)",
+              dur: 188,
+              coverSvg: TRACKS[1].coverSvg
+            }
+          ]
+        },
+        {
+          name: "欧美发烧经典原盘",
+          path: "/sdcard/欧美发烧经典原盘",
+          folders: [],
+          files: [
+            TRACKS[0], // 加州旅馆
+            TRACKS[2], // Bohemian Rhapsody
+            TRACKS[3]  // Bad Guy
+          ]
+        }
+      ],
+      files: [
+        {
+          title: "00_系统开机欢迎音.wav",
+          artist: "CS43131 Self-Test",
+          format: "WAV",
+          rate: "48kHz",
+          bit: "16bit",
+          badge: "WAV 48k 16bit",
+          dur: 12,
+          coverSvg: `<svg xmlns="http://www.w3.org/2000/svg" width="196" height="196" viewBox="0 0 196 196"><rect width="196" height="196" fill="#003366"/><text x="98" y="105" font-size="16" font-weight="bold" fill="#fff" text-anchor="middle" font-family="sans-serif">TEST TONE</text></svg>`
+        }
+      ]
+    };
+
+    let dirStack = [ FS_ROOT ];
+
+    function renderFileList() {
+      const curDir = dirStack[dirStack.length - 1];
+      const container = document.getElementById('fileListContainer');
+      const btnBack = document.getElementById('btnFolderBack');
+      const breadcrumb = document.getElementById('folderPathBreadcrumb');
+      const navTitle = document.getElementById('folderNavTitle');
+
+      // 更新返回按钮与面包屑标题
+      if (dirStack.length > 1) {
+        btnBack.innerText = "‹ 上一级";
+        btnBack.style.color = "#ff9f0a";
+      } else {
+        btnBack.innerText = "🏠 桌面";
+        btnBack.style.color = "#aeaeb2";
+      }
+      navTitle.innerText = curDir.name;
+      breadcrumb.innerHTML = "路径: <b>" + curDir.path + "</b>";
+
+      container.innerHTML = "";
+
+      // 1. 优先渲染子文件夹列表 (Folder Rows)
+      if (curDir.folders && curDir.folders.length > 0) {
+        curDir.folders.forEach((folder) => {
+          const totalItems = (folder.folders ? folder.folders.length : 0) + (folder.files ? folder.files.length : 0);
+          const item = document.createElement('div');
+          item.className = "file-item";
+          item.onclick = () => {
+            dirStack.push(folder);
+            renderFileList();
+            showToast("进入文件夹: " + folder.name);
+          };
+          item.innerHTML = `
+            <div class="file-item-icon folder">📁</div>
+            <div class="file-item-meta">
+              <div class="file-item-name" style="color: #ffaa1d;">${folder.name}</div>
+              <div class="file-item-sub">文件夹 • 内含 ${totalItems} 项</div>
+            </div>
+            <div class="folder-arrow">›</div>
+          `;
+          container.appendChild(item);
+        });
+      }
+
+      // 2. 渲染当前目录下的具体音频曲目 (Audio File Rows)
+      if (curDir.files && curDir.files.length > 0) {
+        curDir.files.forEach((file) => {
+          const isCurrent = (TRACKS[trackIdx] && TRACKS[trackIdx].title === file.title);
+          const item = document.createElement('div');
+          item.className = "file-item" + (isCurrent ? " active" : "");
+          item.onclick = () => {
+            // 将此曲载入全局播放器
+            let foundIdx = TRACKS.findIndex(t => t.title === file.title);
+            if (foundIdx >= 0) {
+              trackIdx = foundIdx;
+            } else {
+              TRACKS.push(file);
+              trackIdx = TRACKS.length - 1;
+            }
+            playSec = 0;
+            updateTrackUI();
+            renderFileList();
+            switchView('player');
+            showToast("播放: " + file.title);
+          };
+          item.innerHTML = `
+            <div class="file-item-icon">${file.format}</div>
+            <div class="file-item-meta">
+              <div class="file-item-name">${file.title}</div>
+              <div class="file-item-sub">${file.artist} • ${file.rate} ${file.bit}</div>
+            </div>
+          `;
+          container.appendChild(item);
+        });
+      }
+
+      if ((!curDir.folders || curDir.folders.length === 0) && (!curDir.files || curDir.files.length === 0)) {
+        container.innerHTML = `<div style="text-align:center; padding: 40px 0; color: #636366; font-size: 13px;">此文件夹为空</div>`;
+      }
+    }
+
+    // 处理文件夹返回上一层操作
+    function onFolderBackClick() {
+      if (dirStack.length > 1) {
+        const popped = dirStack.pop();
+        renderFileList();
+        showToast("返回上一级目录");
+      } else {
+        switchView('launcher');
+      }
+    }
+
+    // 频谱动画
+    setInterval(() => {
+      if (document.getElementById('pageUac').classList.contains('active')) {
+        const bars = document.querySelectorAll('.vis-bar');
+        bars.forEach(b => {
+          const h = 8 + Math.random() * 60;
+          b.style.height = h + "px";
+        });
+      }
+    }, 120);
+
+    // 播放自增
+    setInterval(() => {
+      if (isPlaying) {
+        playSec++;
+        if (playSec > TRACKS[trackIdx].dur) {
+          changeTrack(1);
+        } else {
+          document.getElementById('timeCur').innerText = formatTime(playSec);
+          document.getElementById('progressFill').style.width = ((playSec / TRACKS[trackIdx].dur) * 100) + "%";
+        }
+      }
+    }, 1000);
+
+    // 时钟更新
+    setInterval(() => {
+      const d = new Date();
+      document.getElementById('homeClock').innerText =
+        String(d.getHours()).padStart(2, '0') + ":" + String(d.getMinutes()).padStart(2, '0');
+    }, 10000);
+
+    updateTrackUI();
+    renderFileList();
+  </script>
+</body>
+</html>
