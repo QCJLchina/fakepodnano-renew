@@ -29,7 +29,18 @@ static FILE *s_current_file = NULL;
 static AudioDecoder *s_decoder = NULL;
 static bool s_req_stop = false;
 static bool s_req_new_track = false;
+static bool s_req_seek = false;
+static uint32_t s_seek_sec = 0;
+static bool s_output_held = false;
 static char s_next_path[256] = {0};
+
+static void player_release_output(void)
+{
+    if (s_output_held) {
+        audio_pipeline_release(AUDIO_OWNER_PLAYER);
+        s_output_held = false;
+    }
+}
 
 /* ---------------------------------------------------------------
  * 核心后台播放线程
@@ -60,6 +71,8 @@ static void player_task(void *arg)
                 fclose(s_current_file);
                 s_current_file = NULL;
             }
+            player_release_output();
+            s_req_seek = false;
 
             /* 打开新文件 */
             s_current_file = fopen(s_next_path, "rb");
@@ -72,7 +85,18 @@ static void player_task(void *arg)
                     s_status.current_time_sec = 0;
                     s_status.state = PLAYER_STATE_PLAYING;
 
-                    /* 动态通知音频硬件输出重配采样率与位深 */
+                    if (audio_pipeline_acquire(AUDIO_OWNER_PLAYER) != ESP_OK) {
+                        ESP_LOGW(TAG, "I2S 正被 USB 声卡占用，拒绝本地播放");
+                        s_decoder->close();
+                        delete s_decoder;
+                        s_decoder = NULL;
+                        fclose(s_current_file);
+                        s_current_file = NULL;
+                        s_status.state = PLAYER_STATE_ERROR;
+                        xSemaphoreGive(s_mutex);
+                        continue;
+                    }
+                    s_output_held = true;
                     audio_pipeline_reconfig(&s_status.track_info.fmt);
                     ESP_LOGI(TAG, "开始播放: %s (格式: %lu Hz, %d bit, %d 声道)",
                              s_status.current_path,
@@ -105,9 +129,24 @@ static void player_task(void *arg)
                 fclose(s_current_file);
                 s_current_file = NULL;
             }
+            s_req_seek = false;
             s_status.state = PLAYER_STATE_STOPPED;
+            player_release_output();
             audio_pipeline_flush();
             xSemaphoreGive(s_mutex);
+        }
+
+        /* 跳转只在本任务里做，避免和 decode_frame 同时操作同一个 FILE */
+        if (s_req_seek && s_decoder && s_status.state == PLAYER_STATE_PLAYING) {
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            uint32_t sec = s_seek_sec;
+            s_req_seek = false;
+            xSemaphoreGive(s_mutex);
+            if (s_decoder->seek(sec)) {
+                xSemaphoreTake(s_mutex, portMAX_DELAY);
+                s_status.current_time_sec = sec;
+                xSemaphoreGive(s_mutex);
+            }
         }
 
         /* 3. 正常播放循环 */
@@ -120,8 +159,9 @@ static void player_task(void *arg)
                 audio_pipeline_write(pcm_buf, out_bytes, &written, 200);
 
                 const audio_track_info_t *info = s_decoder->get_info();
-                if (info) {
+                if (info && s_mutex && xSemaphoreTake(s_mutex, 0) == pdTRUE) {
                     s_status.current_time_sec = info->current_time_sec;
+                    xSemaphoreGive(s_mutex);
                 }
             } else if (!ok) {
                 /* 播放结束 */
@@ -137,6 +177,7 @@ static void player_task(void *arg)
                     fclose(s_current_file);
                     s_current_file = NULL;
                 }
+                player_release_output();
                 xSemaphoreGive(s_mutex);
             }
         } else {
@@ -156,11 +197,11 @@ esp_err_t player_service_init(void)
     s_mutex = xSemaphoreCreateMutex();
     if (!s_mutex) return ESP_ERR_NO_MEM;
 
-    /* 创建音频解码专用任务，分配 8KB 任务栈，运行于 Core 1，优先级高 */
+    /* 解码暂存已放到堆上；12KB 覆盖 fopen/解码调用链，避免再把整帧 PCM 放回栈 */
     BaseType_t ret = xTaskCreatePinnedToCore(
         player_task,
         "player_task",
-        8192,
+        12288,
         NULL,
         5,  /* 高于普通任务 */
         &s_task_handle,
@@ -217,10 +258,8 @@ esp_err_t player_seek(uint32_t sec)
 {
     if (!s_task_handle) return ESP_ERR_INVALID_STATE;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    if (s_decoder) {
-        s_decoder->seek(sec);
-        s_status.current_time_sec = sec;
-    }
+    s_seek_sec = sec;
+    s_req_seek = true;
     xSemaphoreGive(s_mutex);
     return ESP_OK;
 }

@@ -5,29 +5,51 @@
 #include "usb_uac_service.h"
 #include "usb_device_uac.h"
 #include "audio_pipeline.h"
-#include "dac_cs43131.h"
 
 #include <string.h>
+#include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 
 static const char *TAG = "USB_UAC";
 
-static uint32_t s_uac_current_sample_rate = 48000;
+static uint32_t s_uac_current_sample_rate = CONFIG_UAC_SAMPLE_RATE;
 static bool s_uac_streaming = false;
+static bool s_uac_held = false;
+
+static void uac_apply_rate(uint32_t sample_rate)
+{
+    audio_format_t fmt = {
+        .sample_rate = sample_rate,
+        .bits_per_sample = CONFIG_UAC_BIT_RESOLUTION,
+        .channels = CONFIG_UAC_SPEAKER_CHANNEL_NUM,
+    };
+    if (audio_pipeline_reconfig(&fmt) != ESP_OK) {
+        ESP_LOGW(TAG, "重配 I2S/DAC 失败: %lu Hz / %d bit", (unsigned long)sample_rate, CONFIG_UAC_BIT_RESOLUTION);
+    }
+}
 
 /* ---------------------------------------------------------------
  * USB 音频扬声器输出数据接收回调
  * --------------------------------------------------------------- */
 static esp_err_t uac_spk_output_cb(uint8_t *buf, size_t len, void *cb_ctx)
 {
+    (void)cb_ctx;
     if (!buf || len == 0) return ESP_OK;
+
+    if (!s_uac_held) {
+        if (audio_pipeline_acquire(AUDIO_OWNER_UAC) != ESP_OK) {
+            s_uac_streaming = false;
+            return ESP_ERR_INVALID_STATE;
+        }
+        s_uac_held = true;
+        uac_apply_rate(s_uac_current_sample_rate);
+    }
 
     s_uac_streaming = true;
     size_t bytes_written = 0;
-    /* 直接推流至 I2S DMA 硬件缓冲区 */
-    return audio_pipeline_write(buf, len, &bytes_written, 100);
+    return audio_pipeline_write(buf, len, &bytes_written, 20);
 }
 
 /* ---------------------------------------------------------------
@@ -50,19 +72,25 @@ static void uac_spk_set_mute_cb(uint32_t mute, void *cb_ctx)
 /* ---------------------------------------------------------------
  * 核心创新：电脑动态切换采样率回调 (突破 16bit 44.1k 瓶颈)
  * --------------------------------------------------------------- */
+static void uac_spk_active_cb(bool active, void *cb_ctx)
+{
+    (void)cb_ctx;
+    if (active) return;
+    s_uac_streaming = false;
+    if (s_uac_held) {
+        audio_pipeline_release(AUDIO_OWNER_UAC);
+        s_uac_held = false;
+    }
+}
+
 static void uac_sample_rate_changed_cb(uint32_t new_sample_rate, void *cb_ctx)
 {
-    ESP_LOGI(TAG, "电脑切换采样率 -> %lu Hz！正在无缝重配 I2S DMA 与 CS43131 DAC...", (unsigned long)new_sample_rate);
+    (void)cb_ctx;
+    ESP_LOGI(TAG, "电脑切换采样率 -> %lu Hz", (unsigned long)new_sample_rate);
     s_uac_current_sample_rate = new_sample_rate;
-
-    audio_format_t new_fmt = {
-        .sample_rate = new_sample_rate,
-        .bits_per_sample = 16, /* 默认或依据 UAC 配置 */
-        .channels = 2,
-    };
-
-    /* 立即重调硬件时钟与 DAC 寄存器 */
-    audio_pipeline_reconfig(&new_fmt);
+    if (s_uac_held) {
+        uac_apply_rate(new_sample_rate);
+    }
 }
 
 /* ---------------------------------------------------------------
@@ -79,6 +107,7 @@ esp_err_t usb_uac_service_start(void)
     cfg.set_volume_cb = uac_spk_set_volume_cb;
     cfg.set_mute_cb = uac_spk_set_mute_cb;
     cfg.set_sample_rate_cb = uac_sample_rate_changed_cb;
+    cfg.spk_active_cb = uac_spk_active_cb;
 
     esp_err_t ret = uac_device_init(&cfg);
     if (ret != ESP_OK) {
@@ -86,13 +115,17 @@ esp_err_t usb_uac_service_start(void)
         return ret;
     }
 
-    ESP_LOGI(TAG, "USB UAC 声卡服务已就绪！支持 44.1k/48k/88.2k/96k/176.4k/192k 多采样率！");
+    ESP_LOGI(TAG, "USB UAC 声卡已就绪：44.1/48/88.2/96 kHz，%d-bit 立体声", CONFIG_UAC_BIT_RESOLUTION);
     return ESP_OK;
 }
 
 esp_err_t usb_uac_service_stop(void)
 {
     s_uac_streaming = false;
+    if (s_uac_held) {
+        audio_pipeline_release(AUDIO_OWNER_UAC);
+        s_uac_held = false;
+    }
     return ESP_OK;
 }
 

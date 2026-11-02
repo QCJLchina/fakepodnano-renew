@@ -55,9 +55,14 @@ esp_err_t cs43131_read_chip_id(i2c_master_bus_handle_t i2c_bus, uint8_t *id);
 
 /**
  * @brief 设置采样率
- * @param sample_rate 采样率（44100/48000/96000/192000 等）
+ * @param sample_rate 采样率（44100/48000/96000 等）
  */
 esp_err_t cs43131_set_sample_rate(i2c_master_bus_handle_t i2c_bus, uint32_t sample_rate);
+
+/**
+ * @brief 设置 PCM 字长，并同步 ASP 槽宽（16 对 16，24/32 对 32）
+ */
+esp_err_t cs43131_set_sample_bits(i2c_master_bus_handle_t i2c_bus, uint8_t bits);
 
 /**
  * @brief 设置音量（硬件音量控制）

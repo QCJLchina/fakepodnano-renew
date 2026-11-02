@@ -27,6 +27,7 @@ private:
     void *m_hAACDecoder;
     audio_track_info_t m_info;
     uint8_t *m_in_buf;
+    short *m_pcm;
     size_t m_in_buf_size;
     size_t m_in_buf_len;
     uint32_t m_data_offset;

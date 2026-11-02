@@ -3,7 +3,7 @@
  * ====================================================
  * 负责：
  *   - 初始化 I2S DMA 主机通道
- *   - 动态调整采样率 (32k~384k) 与位深 (16/24/32bit)
+ *   - 动态调整采样率与位深。USB 全速下最高 96 kHz / 24-bit-in-32。
  *   - 统筹 CS43131 与 ESP32 I2S 硬件时钟同步
  *   - 提供流式 PCM 写入接口，具备 DMA 缓冲与零拷贝机制
  */
@@ -21,10 +21,29 @@ extern "C" {
 
 /** 音频流格式定义 */
 typedef struct {
-    uint32_t sample_rate;       /**< 44100, 48000, 96000, 192000 等 */
+    uint32_t sample_rate;       /**< 44100, 48000, 96000 等 */
     uint8_t  bits_per_sample;   /**< 16, 24, 32 */
     uint8_t  channels;          /**< 1(单声道) 或 2(立体声) */
 } audio_format_t;
+
+/** 同一时刻只允许一个输出者占用 I2S + CS43131 */
+typedef enum {
+    AUDIO_OWNER_NONE = 0,
+    AUDIO_OWNER_PLAYER,
+    AUDIO_OWNER_UAC,
+} audio_owner_t;
+
+/**
+ * @brief 申请独占输出。已被对方占用时返回 ESP_ERR_INVALID_STATE，不会把对方踢下线。
+ */
+esp_err_t audio_pipeline_acquire(audio_owner_t who);
+
+/**
+ * @brief 释放输出。who 不是当前持有者时不做任何事。
+ */
+void audio_pipeline_release(audio_owner_t who);
+
+audio_owner_t audio_pipeline_owner(void);
 
 /**
  * @brief 初始化整个音频输出管线（I2S + CS43131）

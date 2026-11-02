@@ -14,6 +14,7 @@ idf_component_register(
          "audio/decoder_dsd.cpp"
          "audio/decoder_aac.cpp"
          "services/player_service.cpp"
+         "services/sd_library.cpp"
          "services/ble_time_sync.cpp"
          "usb/usb_uac_service.cpp"
          "ui/ui_manager.cpp"

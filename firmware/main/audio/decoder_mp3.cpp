@@ -15,7 +15,7 @@ static const char *TAG = "MP3_DEC";
 #define IN_BUF_CAPACITY (4096)
 
 Mp3Decoder::Mp3Decoder()
-    : m_file(NULL), m_dec(NULL), m_in_buf(NULL), m_in_buf_size(IN_BUF_CAPACITY),
+    : m_file(NULL), m_dec(NULL), m_in_buf(NULL), m_pcm(NULL), m_in_buf_size(IN_BUF_CAPACITY),
       m_in_buf_len(0), m_file_size(0), m_data_offset(0), m_current_sample_count(0)
 {
     memset(&m_info, 0, sizeof(m_info));
@@ -43,9 +43,9 @@ bool Mp3Decoder::open(FILE *file)
     m_dec = (void*)dec;
 
     m_in_buf = (uint8_t*)malloc(m_in_buf_size);
-    if (!m_in_buf) {
-        free(m_dec);
-        m_dec = NULL;
+    m_pcm = (short*)malloc(MINIMP3_MAX_SAMPLES_PER_FRAME * sizeof(short));
+    if (!m_in_buf || !m_pcm) {
+        close();
         return false;
     }
 
@@ -66,8 +66,7 @@ bool Mp3Decoder::open(FILE *file)
     /* 试读首帧以提取采样率与声道信息 */
     m_in_buf_len = fread(m_in_buf, 1, m_in_buf_size, m_file);
     mp3dec_frame_info_t frame_info;
-    short dummy_pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
-    int samples = mp3dec_decode_frame((mp3dec_t*)m_dec, m_in_buf, m_in_buf_len, dummy_pcm, &frame_info);
+    int samples = mp3dec_decode_frame((mp3dec_t*)m_dec, m_in_buf, m_in_buf_len, m_pcm, &frame_info);
 
     if (samples <= 0 || frame_info.hz == 0) {
         ESP_LOGE(TAG, "无法解析 MP3 首帧");
@@ -121,8 +120,7 @@ bool Mp3Decoder::decode_frame(void *pcm_out, size_t max_bytes, size_t *out_bytes
     }
 
     mp3dec_frame_info_t frame_info;
-    short temp_pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
-    int samples = mp3dec_decode_frame((mp3dec_t*)m_dec, m_in_buf, m_in_buf_len, temp_pcm, &frame_info);
+    int samples = mp3dec_decode_frame((mp3dec_t*)m_dec, m_in_buf, m_in_buf_len, m_pcm, &frame_info);
 
     if (frame_info.frame_bytes > 0) {
         /* 移除已消费的数据 */
@@ -139,7 +137,7 @@ bool Mp3Decoder::decode_frame(void *pcm_out, size_t max_bytes, size_t *out_bytes
     if (samples > 0) {
         size_t pcm_bytes = samples * sizeof(short) * frame_info.channels;
         if (pcm_bytes > max_bytes) pcm_bytes = max_bytes;
-        memcpy(pcm_out, temp_pcm, pcm_bytes);
+        memcpy(pcm_out, m_pcm, pcm_bytes);
         if (out_bytes) *out_bytes = pcm_bytes;
 
         m_current_sample_count += samples;
@@ -179,6 +177,10 @@ void Mp3Decoder::close()
     if (m_in_buf) {
         free(m_in_buf);
         m_in_buf = NULL;
+    }
+    if (m_pcm) {
+        free(m_pcm);
+        m_pcm = NULL;
     }
     m_file = NULL;
     m_in_buf_len = 0;

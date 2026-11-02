@@ -174,19 +174,28 @@ esp_err_t cs43131_set_sample_rate(i2c_master_bus_handle_t i2c_bus, uint32_t sr)
     return ESP_OK;
 }
 
-/* 设置位宽 16 / 24 / 32 bit */
-esp_err_t cs43131_set_sample_bits(uint8_t bits)
+/* 设置位宽 16 / 24 / 32 bit，并让 ASP 槽宽跟着变。
+ * 0x05000A 的低 2 位是槽宽：0=32，1=24，2=16，3=8。高位保留通道使能。 */
+esp_err_t cs43131_set_sample_bits(i2c_master_bus_handle_t i2c_bus, uint8_t bits)
 {
-    uint8_t reg = 0;
+    (void)i2c_bus;
+    uint8_t word = 0;
+    uint8_t slot = 0;
     switch (bits) {
-        case 32: reg = 0; break;
-        case 24: reg = 1; break;
-        case 16: reg = 2; break;
-        case 8:  reg = 3; break;
-        default: reg = 0; break;
+        case 32: word = 0; slot = 0; break;
+        case 24: word = 1; slot = 0; break; /* 24 有效位放在 32-bit slot 高位 */
+        case 16: word = 2; slot = 2; break;
+        case 8:  word = 3; slot = 3; break;
+        default: word = 2; slot = 2; bits = 16; break;
     }
-    write_reg(0x01000C, reg);
-    ESP_LOGI(TAG, "CS43131 位宽设置为: %d bit", bits);
+    write_reg(0x01000C, word);
+    uint8_t asp = 0;
+    if (read_reg(0x05000A, &asp) != ESP_OK) {
+        asp = 0x04; /* 保留原来的通道使能位 */
+    }
+    asp = (uint8_t)((asp & ~0x03) | (slot & 0x03));
+    write_reg(0x05000A, asp);
+    ESP_LOGI(TAG, "CS43131 位宽设置为: %d bit（槽宽编码 %u）", bits, slot);
     return ESP_OK;
 }
 
@@ -234,16 +243,15 @@ esp_err_t cs43131_init(i2c_master_bus_handle_t i2c_bus)
     write_reg(0x010006, 0x05); // Internal MCLK -> PLL Mode
 
     /* 7. ASP 音频串行口配置 (从机模式接收来自 ESP32 I2S 主机的数据) */
-    cs43131_set_sample_rate(i2c_bus, 48000);
-    cs43131_set_sample_bits(16);
-
     write_reg(0x01000D, 0x00); // ASP 时钟活跃
     write_reg(0x040018, 0x0C); // ASP Master/Slave 协议与反相设置
     write_reg(0x040019, 0x0A); // 50/50 占空比, 帧起始延迟
     write_reg(0x050000, 0x00); // 通道 1 起始位置
     write_reg(0x050001, 0x00); // 通道 2 起始位置
-    write_reg(0x05000A, 0x07); // 32bit / 左右通道激活
+    write_reg(0x05000A, 0x04); // 先只开左右通道，槽宽由下面的位宽设置覆盖
     write_reg(0x05000B, 0x0F);
+    cs43131_set_sample_rate(i2c_bus, 48000);
+    cs43131_set_sample_bits(i2c_bus, 16);
 
     /* 8. PCM 通路核心控制 */
     write_reg(0x090000, 0x00); // 滤波器模式

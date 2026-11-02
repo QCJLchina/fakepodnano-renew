@@ -18,6 +18,7 @@ static lv_obj_t *s_lbl_time_cur = NULL;
 static lv_obj_t *s_lbl_time_tot = NULL;
 static lv_obj_t *s_btn_play = NULL;
 static lv_obj_t *s_lbl_play_icon = NULL;
+static bool s_slider_dragging = false;
 
 static void btn_play_click_cb(lv_event_t *e)
 {
@@ -32,9 +33,16 @@ static void btn_play_click_cb(lv_event_t *e)
 
 static void slider_progress_cb(lv_event_t *e)
 {
-    lv_obj_t *slider = lv_event_get_target(e);
-    uint32_t val = (uint32_t)lv_slider_get_value(slider);
-    player_seek(val);
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_PRESSED) {
+        s_slider_dragging = true;
+        return;
+    }
+    if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        s_slider_dragging = false;
+        lv_obj_t *slider = lv_event_get_target(e);
+        player_seek((uint32_t)lv_slider_get_value(slider));
+    }
 }
 
 lv_obj_t* ui_view_player_create(void)
@@ -92,7 +100,9 @@ lv_obj_t* ui_view_player_create(void)
     lv_obj_set_style_bg_color(s_slider_progress, lv_palette_main(LV_PALETTE_AMBER), LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(s_slider_progress, lv_color_white(), LV_PART_KNOB);
     lv_obj_set_style_pad_all(s_slider_progress, 2, LV_PART_KNOB);
-    lv_obj_add_event_cb(s_slider_progress, slider_progress_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(s_slider_progress, slider_progress_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(s_slider_progress, slider_progress_cb, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(s_slider_progress, slider_progress_cb, LV_EVENT_PRESS_LOST, NULL);
 
     s_lbl_time_cur = lv_label_create(s_screen);
     lv_obj_set_style_text_color(s_lbl_time_cur, lv_color_make(140, 140, 150), 0);
@@ -162,9 +172,11 @@ void ui_view_player_update(void)
         lv_label_set_text(s_lbl_badge, badge_buf);
     }
 
-    /* 3. 更新进度条与时间 */
-    lv_slider_set_range(s_slider_progress, 0, st.total_time_sec ? st.total_time_sec : 100);
-    lv_slider_set_value(s_slider_progress, st.current_time_sec, LV_ANIM_OFF);
+    /* 3. 更新进度条与时间。拖动期间不回写，否则手指会被播放进度拽回去。 */
+    if (!s_slider_dragging) {
+        lv_slider_set_range(s_slider_progress, 0, st.total_time_sec ? st.total_time_sec : 100);
+        lv_slider_set_value(s_slider_progress, st.current_time_sec, LV_ANIM_OFF);
+    }
 
     char time_str[16];
     snprintf(time_str, sizeof(time_str), "%02lu:%02lu",

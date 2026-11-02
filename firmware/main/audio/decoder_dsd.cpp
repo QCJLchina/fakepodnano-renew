@@ -89,6 +89,11 @@ bool DsdDecoder::open(FILE *file)
     if (fread(&fmt, 1, sizeof(fmt), m_file) != sizeof(fmt)) return false;
     if (memcmp(fmt.chunk_id, "fmt ", 4) != 0 || fmt.bits_per_sample != 1) return false;
 
+    /* DAC 初始化序列没有打开 DSD/DoP 检测，继续封装只会把噪声送进 PCM 通路。 */
+    ESP_LOGE(TAG, "DSF 已识别，但 CS43131 仍在 PCM 模式，DoP 未接通，拒绝播放");
+    m_file = NULL;
+    return false;
+
     dsf_data_chunk_t data_chunk;
     if (fread(&data_chunk, 1, sizeof(data_chunk), m_file) != sizeof(data_chunk)) return false;
     if (memcmp(data_chunk.chunk_id, "data", 4) != 0) return false;
@@ -96,6 +101,11 @@ bool DsdDecoder::open(FILE *file)
     m_data_offset = ftell(m_file);
     m_data_size = data_chunk.chunk_size - sizeof(data_chunk);
     m_block_size = fmt.block_size_per_channel;
+    if (m_block_size == 0 || m_block_size > 64 * 1024) {
+        ESP_LOGE(TAG, "DSF 块大小异常: %lu", (unsigned long)m_block_size);
+        m_file = NULL;
+        return false;
+    }
     m_channel_num = fmt.channel_num;
     m_sample_count = fmt.sample_count;
 

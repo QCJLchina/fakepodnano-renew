@@ -2,7 +2,7 @@
  * FAKE_POD_NANO FLAC 无损音频解码器
  * ============================================
  * 基于 dr_flac 单头文件无损解码引擎
- * 支持 16bit / 24bit / 32bit FLAC，最大 192kHz/384kHz
+ * 支持 16/24/32 bit。超过 16 bit 的样本会左对齐到 32-bit I2S slot。
  */
 
 #pragma once

@@ -32,7 +32,8 @@ extern "C" {
 // How many formats are used, need to adjust USB descriptor if changed
 #define CFG_TUD_AUDIO_FUNC_1_N_FORMATS                               1
 
-#define CFG_TUD_AUDIO_FUNC_1_MAX_SAMPLE_RATE                         384000
+/* 包长按同一张表的最高采样率计算。96k × 4 × 2 = 768，再留一帧仍低于 1023。 */
+#define CFG_TUD_AUDIO_FUNC_1_MAX_SAMPLE_RATE                         UAC_SAMPLE_RATE_MAX
 #define CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_TX                           MIC_CHANNEL_NUM
 #define CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX                           SPEAK_CHANNEL_NUM
 
@@ -46,7 +47,8 @@ extern "C" {
 #define CFG_TUD_AUDIO_FUNC_1_FORMAT_1_FRAME_SZ_RX                    (CFG_TUD_AUDIO_FUNC_1_FORMAT_1_N_BYTES_PER_SAMPLE_RX * CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX)
 
 // EP and buffer size - for isochronous EP´s, the buffer and EP size are equal (different sizes would not make sense)
-#define CFG_TUD_AUDIO_ENABLE_EP_IN                1
+/* 本机没有麦克风数据。关掉 IN 端点，避免 TinyUSB 仍按麦克风包长分配缓冲。 */
+#define CFG_TUD_AUDIO_ENABLE_EP_IN                0
 
 // MIC IN EP (device-to-host = TX): keep EP size aligned to one complete audio frame.
 #define CFG_TUD_AUDIO_FUNC_1_FORMAT_1_EP_SZ_IN    ((CFG_TUD_AUDIO_FUNC_1_MAX_SAMPLE_RATE / 1000 * CFG_TUD_AUDIO_FUNC_1_FORMAT_1_FRAME_SZ_TX) + CFG_TUD_AUDIO_FUNC_1_FORMAT_1_FRAME_SZ_TX)
@@ -72,6 +74,7 @@ extern "C" {
 #define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX        CFG_TUD_AUDIO_FUNC_1_FORMAT_1_EP_SZ_OUT // Maximum EP OUT size for all AS alternate settings used
 
 // Number of Standard AS Interface Descriptors (4.9.1) defined per audio function - this is required to be able to remember the current alternate settings of these interfaces - We restrict us here to have a constant number for all audio functions (which means this has to be the maximum number of AS interfaces an audio function has and a second audio function with less AS interfaces just wastes a few bytes)
+/* 本机只开扬声器，一条 AS 接口。麦克风重新打开时这里必须改成实际的 AS 接口数。 */
 #define CFG_TUD_AUDIO_FUNC_1_N_AS_INT             1
 
 // Size of control request buffer

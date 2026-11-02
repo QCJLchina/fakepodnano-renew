@@ -1,7 +1,7 @@
 /**
  * FAKE_POD_NANO 主程序
  * ============================================
- * 阶段 1 验证版：初始化硬件 → 屏幕点亮 → I2C 扫描
+ * 初始化硬件、屏幕、音频，并在 TF 卡根目录自动播放第一首曲目。
  */
 
 #include <stdio.h>
@@ -15,6 +15,7 @@
 #include "lcd_co5300.h"
 #include "audio_pipeline.h"
 #include "player_service.h"
+#include "sd_library.h"
 #include "ui_manager.h"
 #include "usb_uac_service.h"
 #include "ble_time_sync.h"
@@ -62,20 +63,31 @@ extern "C" void app_main(void)
     /* 5. 启动音频播放管理服务 (WAV/FLAC/MP3/AAC/DSD) */
     err = player_service_init();
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "多格式本地音频播放服务就绪！支持: WAV / FLAC / MP3 / AAC-M4A / DSD(DoP)");
+        ESP_LOGI(TAG, "本地播放就绪：WAV / FLAC / MP3 / ADTS AAC。裸 M4A 与 DSD 会拒绝");
     } else {
         ESP_LOGE(TAG, "音频播放服务启动失败: %s", esp_err_to_name(err));
     }
 
-    /* 6. 启动 USB 多采样率声卡服务 (突破 16bit 44.1k 限制) */
+    /* 6. 启动 USB 声卡。全速下最高 96 kHz / 24-bit，并与本地播放互斥。 */
     err = usb_uac_service_start();
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "USB 高保真声卡模式已在线 (支持 44.1k ~ 192kHz 动态多采样率)");
+        ESP_LOGI(TAG, "USB 声卡已在线 (44.1k ~ 96kHz, 24-bit)");
     } else {
         ESP_LOGW(TAG, "USB 声卡服务启动跳过或失败: %s", esp_err_to_name(err));
     }
 
-    /* 7. 启动 BLE 无线对时服务 (支持手机浏览器 Web Bluetooth 一键秒连校时) */
+    /* 7. 挂载 TF 卡并播放根目录第一首 wav/flac/mp3/aac。USB 正在占用 I2S 时会拒绝。 */
+    err = sd_library_mount();
+    if (err == ESP_OK) {
+        char track[256];
+        if (sd_library_first_track(track, sizeof(track)) == ESP_OK) {
+            player_play(track);
+        } else {
+            ESP_LOGW(TAG, "TF 卡根目录没有可播放的 wav/flac/mp3/aac");
+        }
+    }
+
+    /* 8. 启动 BLE 无线对时服务 (支持手机浏览器 Web Bluetooth 一键秒连校时) */
     err = ble_time_sync_start();
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "BLE 无线对时服务已就绪 (广播名: FAKE_POD_NANO)");

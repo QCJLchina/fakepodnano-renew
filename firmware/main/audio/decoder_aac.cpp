@@ -13,7 +13,7 @@ static const char *TAG = "AAC_DEC";
 #define AAC_IN_BUF_SIZE (4096)
 
 AacDecoder::AacDecoder()
-    : m_file(NULL), m_hAACDecoder(NULL), m_in_buf(NULL), m_in_buf_size(AAC_IN_BUF_SIZE),
+    : m_file(NULL), m_hAACDecoder(NULL), m_in_buf(NULL), m_pcm(NULL), m_in_buf_size(AAC_IN_BUF_SIZE),
       m_in_buf_len(0), m_data_offset(0), m_file_size(0), m_total_samples(0), m_current_samples(0)
 {
     memset(&m_info, 0, sizeof(m_info));
@@ -83,12 +83,13 @@ bool AacDecoder::open(FILE *file)
     }
 
     m_in_buf = (uint8_t*)malloc(m_in_buf_size);
-    if (!m_in_buf) {
+    m_pcm = (short*)malloc(2048 * 2 * sizeof(short));
+    if (!m_in_buf || !m_pcm) {
         close();
         return false;
     }
 
-    /* 试探首帧获取采样率与声道信息 */
+    /* Helix 只吃 ADTS。MP4 mdat 里的裸 AAC 没有同步字，不能假装打开成功。 */
     fseek(m_file, m_data_offset, SEEK_SET);
     m_in_buf_len = fread(m_in_buf, 1, m_in_buf_size, m_file);
 
@@ -96,29 +97,28 @@ bool AacDecoder::open(FILE *file)
     int bytes_left = m_in_buf_len;
 
     int sync_offset = AACFindSyncWord(read_ptr, bytes_left);
-    if (sync_offset >= 0) {
-        read_ptr += sync_offset;
-        bytes_left -= sync_offset;
+    if (sync_offset < 0) {
+        ESP_LOGE(TAG, "未找到 ADTS 同步字。裸 M4A 需要先解封装，本次拒绝播放");
+        close();
+        return false;
     }
+    read_ptr += sync_offset;
+    bytes_left -= sync_offset;
 
-    short dummy_pcm[2048 * 2];
-    int err = AACDecode((HAACDecoder)m_hAACDecoder, &read_ptr, &bytes_left, dummy_pcm);
-    if (err == 0) {
-        AACFrameInfo frame_info;
-        AACGetLastFrameInfo((HAACDecoder)m_hAACDecoder, &frame_info);
-        m_info.fmt.sample_rate = frame_info.sampRateOut;
-        m_info.fmt.channels = (uint8_t)frame_info.nChans;
-        m_info.fmt.bits_per_sample = (uint8_t)frame_info.bitsPerSample;
-        m_info.bit_rate = frame_info.bitRate / 1000;
-        if (m_info.bit_rate > 0) {
-            m_info.total_time_sec = (m_file_size - m_data_offset) * 8 / (m_info.bit_rate * 1000);
-        }
-    } else {
-        /* 预设默认高质量参数（M4A 常用 44.1k/48k 16bit） */
-        m_info.fmt.sample_rate = 44100;
-        m_info.fmt.channels = 2;
-        m_info.fmt.bits_per_sample = 16;
-        m_info.total_time_sec = 0;
+    int err = AACDecode((HAACDecoder)m_hAACDecoder, &read_ptr, &bytes_left, m_pcm);
+    if (err != 0) {
+        ESP_LOGE(TAG, "AAC 首帧解码失败: %d", err);
+        close();
+        return false;
+    }
+    AACFrameInfo frame_info;
+    AACGetLastFrameInfo((HAACDecoder)m_hAACDecoder, &frame_info);
+    m_info.fmt.sample_rate = frame_info.sampRateOut;
+    m_info.fmt.channels = (uint8_t)frame_info.nChans;
+    m_info.fmt.bits_per_sample = (uint8_t)frame_info.bitsPerSample;
+    m_info.bit_rate = frame_info.bitRate / 1000;
+    if (m_info.bit_rate > 0) {
+        m_info.total_time_sec = (m_file_size - m_data_offset) * 8 / (m_info.bit_rate * 1000);
     }
 
     /* 重新归位，准备播放 */
@@ -126,7 +126,7 @@ bool AacDecoder::open(FILE *file)
     m_in_buf_len = 0;
     m_current_samples = 0;
 
-    ESP_LOGI(TAG, "成功打开 AAC/M4A: %lu Hz, %d 声道, %d bit",
+    ESP_LOGI(TAG, "成功打开 ADTS AAC: %lu Hz, %d 声道, %d bit",
              (unsigned long)m_info.fmt.sample_rate, m_info.fmt.channels,
              m_info.fmt.bits_per_sample);
 
@@ -160,15 +160,26 @@ bool AacDecoder::decode_frame(void *pcm_out, size_t max_bytes, size_t *out_bytes
     unsigned char *read_ptr = m_in_buf;
     int bytes_left = m_in_buf_len;
 
-    /* 寻找帧同步字 */
+    /* 没有同步字就不要交给 Helix。留最后一个字节，避免同步字跨在两次读取中间。 */
     int sync_offset = AACFindSyncWord(read_ptr, bytes_left);
+    if (sync_offset < 0) {
+        if (feof(m_file)) {
+            if (out_bytes) *out_bytes = 0;
+            return false;
+        }
+        if (m_in_buf_len > 1) {
+            m_in_buf[0] = m_in_buf[m_in_buf_len - 1];
+            m_in_buf_len = 1;
+        }
+        if (out_bytes) *out_bytes = 0;
+        return true;
+    }
     if (sync_offset > 0) {
         read_ptr += sync_offset;
         bytes_left -= sync_offset;
     }
 
-    short temp_pcm[2048 * 2];
-    int err = AACDecode((HAACDecoder)m_hAACDecoder, &read_ptr, &bytes_left, temp_pcm);
+    int err = AACDecode((HAACDecoder)m_hAACDecoder, &read_ptr, &bytes_left, m_pcm);
 
     int consumed = m_in_buf_len - bytes_left;
     if (consumed > 0 && (size_t)consumed <= m_in_buf_len) {
@@ -182,7 +193,7 @@ bool AacDecoder::decode_frame(void *pcm_out, size_t max_bytes, size_t *out_bytes
 
         size_t pcm_bytes = frame_info.outputSamps * sizeof(short);
         if (pcm_bytes > max_bytes) pcm_bytes = max_bytes;
-        memcpy(pcm_out, temp_pcm, pcm_bytes);
+        memcpy(pcm_out, m_pcm, pcm_bytes);
         if (out_bytes) *out_bytes = pcm_bytes;
 
         m_current_samples += frame_info.outputSamps / frame_info.nChans;
@@ -193,7 +204,7 @@ bool AacDecoder::decode_frame(void *pcm_out, size_t max_bytes, size_t *out_bytes
     }
 
     if (out_bytes) *out_bytes = 0;
-    return true;
+    return false;
 }
 
 bool AacDecoder::seek(uint32_t target_sec)
@@ -222,6 +233,10 @@ void AacDecoder::close()
     if (m_in_buf) {
         free(m_in_buf);
         m_in_buf = NULL;
+    }
+    if (m_pcm) {
+        free(m_pcm);
+        m_pcm = NULL;
     }
     m_file = NULL;
     m_in_buf_len = 0;

@@ -19,17 +19,8 @@
 
 static const char *TAG = "usbd_uac";
 
-/* 支持全部主流高保真无损采样率：44.1k/48k/88.2k/96k/176.4k/192k/352.8k/384k */
-const uint32_t sample_rates[] = {
-    44100,
-    48000,
-    88200,
-    96000,
-    176400,
-    192000,
-    352800,
-    384000
-};
+/* 全速 USB 同步包上限 1023 字节。采样率只取 uac_config.h 里的那一张表。 */
+const uint32_t sample_rates[] = { UAC_SAMPLE_RATE_LIST };
 
 #define N_SAMPLE_RATES  TU_ARRAY_SIZE(sample_rates)
 
@@ -347,6 +338,9 @@ bool tud_audio_set_itf_close_EP_cb(uint8_t rhport, tusb_control_request_t const 
         TU_LOG2("Speaker interface closed");
         s_uac_device->spk_data_size = 0;
         s_uac_device->spk_active = false;
+        if (s_uac_device->user_cfg.spk_active_cb) {
+            s_uac_device->user_cfg.spk_active_cb(false, s_uac_device->user_cfg.cb_ctx);
+        }
     }
 #endif
 
@@ -376,6 +370,9 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
         s_uac_device->spk_active = true;
         s_uac_device->spk_bytes_per_ms = s_uac_device->current_sample_rate / 1000 * SPEAK_CHANNEL_NUM * CFG_TUD_AUDIO_FUNC_1_FORMAT_1_N_BYTES_PER_SAMPLE_RX;
         xTaskNotifyGive(s_uac_device->spk_task_handle);
+        if (s_uac_device->user_cfg.spk_active_cb) {
+            s_uac_device->user_cfg.spk_active_cb(true, s_uac_device->user_cfg.cb_ctx);
+        }
         TU_LOG1("Speaker interface %d-%d opened", itf, alt);
         printf("Speaker interface %d-%d opened\n", itf, alt);
     }
@@ -451,6 +448,8 @@ bool tud_audio_rx_done_isr(uint8_t rhport, uint16_t n_bytes_received, uint8_t fu
     return true;
 }
 
+/* IN 端点关闭（无麦克风数据）时，TinyUSB 不声明发送侧 API，本回调也不会被触发。 */
+#if CFG_TUD_AUDIO_ENABLE_EP_IN
 bool tud_audio_tx_done_isr(uint8_t rhport, uint16_t n_bytes_sent, uint8_t func_id, uint8_t ep_in, uint8_t cur_alt_setting)
 {
     (void)rhport;
@@ -475,6 +474,7 @@ bool tud_audio_tx_done_isr(uint8_t rhport, uint16_t n_bytes_sent, uint8_t func_i
 
     return true;
 }
+#endif /* CFG_TUD_AUDIO_ENABLE_EP_IN */
 
 #if SPEAK_CHANNEL_NUM
 static void usb_spk_task(void *pvParam)
@@ -546,6 +546,8 @@ esp_err_t uac_device_init(uac_device_config_t *config)
     s_uac_device->user_cfg.cb_ctx = config->cb_ctx;
     s_uac_device->user_cfg.set_mute_cb = config->set_mute_cb;
     s_uac_device->user_cfg.set_volume_cb = config->set_volume_cb;
+    s_uac_device->user_cfg.set_sample_rate_cb = config->set_sample_rate_cb;
+    s_uac_device->user_cfg.spk_active_cb = config->spk_active_cb;
     s_uac_device->current_sample_rate = DEFAULT_SAMPLE_RATE;
     s_uac_device->mic_buf_write = s_uac_device->mic_buf1;
     s_uac_device->mic_buf_read = s_uac_device->mic_buf2;

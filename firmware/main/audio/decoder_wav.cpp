@@ -4,6 +4,7 @@
 
 #include "decoder_wav.h"
 #include "esp_log.h"
+#include <stdlib.h>
 #include <string.h>
 
 static const char *TAG = "WAV_DEC";
@@ -31,7 +32,7 @@ typedef struct {
 #pragma pack(pop)
 
 WavDecoder::WavDecoder()
-    : m_file(NULL), m_data_offset(0), m_data_size(0), m_bytes_read(0), m_bytes_per_sec(0)
+    : m_file(NULL), m_pack(NULL), m_data_offset(0), m_data_size(0), m_bytes_read(0), m_bytes_per_sec(0)
 {
     memset(&m_info, 0, sizeof(m_info));
     m_info.type = DECODER_TYPE_WAV;
@@ -86,10 +87,22 @@ bool WavDecoder::open(FILE *file)
         ESP_LOGE(TAG, "非标准未压缩 PCM WAV 格式");
         return false;
     }
+    if (fmt.bits_per_sample != 16 && fmt.bits_per_sample != 24 && fmt.bits_per_sample != 32) {
+        ESP_LOGE(TAG, "WAV 位宽 %u 不能直接送进 I2S", fmt.bits_per_sample);
+        return false;
+    }
+    if (fmt.num_channels == 0 || fmt.num_channels > 2) {
+        ESP_LOGE(TAG, "WAV 声道数 %u 不支持", fmt.num_channels);
+        return false;
+    }
 
     m_info.fmt.sample_rate = fmt.sample_rate;
     m_info.fmt.bits_per_sample = (uint8_t)fmt.bits_per_sample;
     m_info.fmt.channels = (uint8_t)fmt.num_channels;
+    if (fmt.bits_per_sample == 24) {
+        m_pack = (uint8_t *)malloc(4096);
+        if (!m_pack) return false;
+    }
     m_bytes_per_sec = fmt.byte_rate;
     m_info.bit_rate = fmt.byte_rate * 8 / 1000;
     m_info.total_time_sec = m_bytes_per_sec ? (m_data_size / m_bytes_per_sec) : 0;
@@ -114,10 +127,42 @@ bool WavDecoder::decode_frame(void *pcm_out, size_t max_bytes, size_t *out_bytes
         return false;
     }
 
+    /* 24-bit WAV 是每样本 3 字节。I2S 要 4 字节且左对齐，不能原样塞进去。 */
+    if (m_info.fmt.bits_per_sample == 24) {
+        size_t channels = m_info.fmt.channels;
+        size_t in_frame = channels * 3;
+        size_t out_frame = channels * 4;
+        size_t max_in = max_bytes / out_frame * in_frame;
+        if (max_in > 4096) max_in = 4096 / in_frame * in_frame;
+        size_t remain = m_data_size - m_bytes_read;
+        if (max_in > remain) max_in = remain / in_frame * in_frame;
+        if (max_in == 0) {
+            if (out_bytes) *out_bytes = 0;
+            return false;
+        }
+
+        size_t n = fread(m_pack, 1, max_in, m_file);
+        n = n / in_frame * in_frame;
+        int32_t *dst = (int32_t *)pcm_out;
+        for (size_t i = 0; i + 2 < n; i += 3) {
+            uint32_t packed = (uint32_t)m_pack[i]
+                            | ((uint32_t)m_pack[i + 1] << 8)
+                            | ((uint32_t)m_pack[i + 2] << 16);
+            *dst++ = (int32_t)(packed << 8);
+        }
+        m_bytes_read += n;
+        if (out_bytes) *out_bytes = (n / 3) * 4;
+        if (m_bytes_per_sec) m_info.current_time_sec = m_bytes_read / m_bytes_per_sec;
+        return n > 0;
+    }
+
+    size_t frame = m_info.fmt.channels * (m_info.fmt.bits_per_sample / 8);
     size_t to_read = m_data_size - m_bytes_read;
     if (to_read > max_bytes) to_read = max_bytes;
+    if (frame) to_read -= to_read % frame;
 
     size_t r = fread(pcm_out, 1, to_read, m_file);
+    if (frame) r -= r % frame;
     m_bytes_read += r;
     if (out_bytes) *out_bytes = r;
 
@@ -133,6 +178,8 @@ bool WavDecoder::seek(uint32_t target_sec)
 
     uint32_t target_offset = target_sec * m_bytes_per_sec;
     if (target_offset > m_data_size) target_offset = m_data_size;
+    uint32_t frame = m_info.fmt.channels * (m_info.fmt.bits_per_sample == 24 ? 3 : m_info.fmt.bits_per_sample / 8);
+    if (frame) target_offset -= target_offset % frame;
 
     fseek(m_file, m_data_offset + target_offset, SEEK_SET);
     m_bytes_read = target_offset;
@@ -142,6 +189,10 @@ bool WavDecoder::seek(uint32_t target_sec)
 
 void WavDecoder::close()
 {
+    if (m_pack) {
+        free(m_pack);
+        m_pack = NULL;
+    }
     m_file = NULL;
     m_bytes_read = 0;
 }

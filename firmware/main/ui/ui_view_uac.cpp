@@ -27,14 +27,14 @@ lv_obj_t* ui_view_uac_create(void)
     s_lbl_rate_big = lv_label_create(s_screen_uac);
     lv_obj_set_style_text_color(s_lbl_rate_big, lv_palette_main(LV_PALETTE_CYAN), 0);
     lv_obj_set_style_text_font(s_lbl_rate_big, &lv_font_montserrat_32, 0);
-    lv_label_set_text(s_lbl_rate_big, "96.0 kHz");
+    lv_label_set_text(s_lbl_rate_big, "-- kHz");
     lv_obj_align(s_lbl_rate_big, LV_ALIGN_CENTER, 0, -40);
 
     /* 采样位宽与通道指示 */
     lv_obj_t *desc = lv_label_create(s_screen_uac);
     lv_obj_set_style_text_color(desc, lv_color_white(), 0);
     lv_obj_set_style_text_font(desc, &lv_font_montserrat_16, 0);
-    lv_label_set_text(desc, "24-bit / 32-bit Hi-Res Audio");
+    lv_label_set_text(desc, "24-bit / stereo, up to 96 kHz");
     lv_obj_align(desc, LV_ALIGN_CENTER, 0, 5);
 
     /* 动态音频推流状态指示 */

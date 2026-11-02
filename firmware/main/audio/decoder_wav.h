@@ -20,6 +20,7 @@ public:
 private:
     FILE *m_file;
     audio_track_info_t m_info;
+    uint8_t *m_pack;
     uint32_t m_data_offset;
     uint32_t m_data_size;
     uint32_t m_bytes_read;

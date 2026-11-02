@@ -102,6 +102,13 @@ bool FlacDecoder::decode_frame(void *pcm_out, size_t max_bytes, size_t *out_byte
         frames_read = drflac_read_pcm_frames_s16(pFlac, max_frames, (drflac_int16*)pcm_out);
     } else {
         frames_read = drflac_read_pcm_frames_s32(pFlac, max_frames, (drflac_int32*)pcm_out);
+        /* dr_flac 的 s32 是右对齐的有符号值；I2S 32-bit slot 要左对齐。 */
+        uint32_t shift = 32 - bps;
+        drflac_int32 *samples = (drflac_int32 *)pcm_out;
+        size_t count = (size_t)frames_read * channels;
+        for (size_t i = 0; i < count; i++) {
+            samples[i] <<= shift;
+        }
     }
 
     m_current_frame += frames_read;
