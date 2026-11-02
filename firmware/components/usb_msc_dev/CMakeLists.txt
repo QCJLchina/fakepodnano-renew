@@ -8,7 +8,7 @@ endif()
 
 idf_component_register(SRCS "usb_msc_dev.c"
                        INCLUDE_DIRS "include"
-                       PRIV_REQUIRES esp_driver_sdmmc ${tinyusb_name})
+                       PRIV_REQUIRES esp_driver_sdmmc ${tinyusb_name} usb)
 
 # 仅在 U盘(MSC)模式固件里，把本组件的 tusb 描述符挂到 tinyusb 库上
 if(CONFIG_FAKEPOD_USB_MSC_MODE)

@@ -10,11 +10,14 @@
  *     R53 20 / R63 FF / R2A 00 0A 01 D5 / R2B 00 00 01 CB
  *     R29 + 60ms / R51 FF / R58 07 + 10ms
  *
- * 本文件除面板初始化外，还负责【刷新同步】，这是以前缺的两件事：
- *   1) DMA 完成同步 —— 提交一块像素后等它真正传完，再让 LVGL 复用该缓冲区，
- *      否则 LVGL 会在 DMA 还在读的时候把下一帧画进同一块内存（花屏 / 横向撕裂）
- *   2) TE 同步（可选）—— 每个刷新周期开始前等面板的 vblank 上升沿再写 GRAM，
- *      把写显存的时刻放进消隐期，进一步压低撕裂
+ * 本文件除面板初始化外，还负责【刷新同步】：
+ *   1) DMA 完成同步 —— 提交一块像素后等它真正传完，再让 LVGL 复用该缓冲区。
+ *      这是 IDF 文档对 color 缓冲区的生命周期要求（复用时刻在 on_color_trans_done 之后）；
+ *      当前 PSRAM 缓冲走内部 bounce buffer 拷贝，提前复用只是"侥幸安全"，
+ *      换成内部 DMA 内存或打开 psram_dma_direct 就会变成真竞态。
+ *   2) TE 同步（可选）—— 每个刷新周期第一块数据写 GRAM 之前等面板 vblank 上升沿，
+ *      把写显存的时刻放进消隐期，这才是消除横向撕裂的关键。
+ *      面板若不出 TE 脉冲（0x35=00 不保证输出），连续超时后自动降级为自由运行。
  */
 
 #include "lcd_co5300.h"
@@ -75,7 +78,11 @@ static SemaphoreHandle_t s_trans_done_sem = NULL;
 /* TE 撕裂同步 */
 static SemaphoreHandle_t s_te_sem = NULL;
 static bool s_te_sync_on = (LCD_TE_SYNC_ENABLE != 0);
-static volatile uint32_t s_te_timeout_cnt = 0;
+static bool s_te_isr_installed = false;
+static uint32_t s_te_timeout_cnt = 0;
+
+/* 上一次等待超时、仍未确认完成的传输 */
+static bool s_trans_pending = false;
 
 /* DMA 完成回调：每提交完一块颜色数据，硬件传完后进这里（ISR 上下文）
  *
@@ -139,7 +146,7 @@ static esp_err_t lcd_te_sync_init(void)
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_POSEDGE,
+        .intr_type = GPIO_INTR_DISABLE,     /* 先关中断，挂好 handler 再开，避免窗口期空转 */
     };
     esp_err_t err = gpio_config(&io_conf);
     if (err != ESP_OK) {
@@ -160,6 +167,17 @@ static esp_err_t lcd_te_sync_init(void)
         return err;
     }
 
+    /* handler 就绪后再打开上升沿中断 */
+    err = gpio_set_intr_type((gpio_num_t)LCD_PIN_TE, GPIO_INTR_POSEDGE);
+    if (err == ESP_OK) {
+        err = gpio_intr_enable((gpio_num_t)LCD_PIN_TE);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "TE(GPIO%d) 中断使能失败: %s", LCD_PIN_TE, esp_err_to_name(err));
+        return err;
+    }
+
+    s_te_isr_installed = true;
     ESP_LOGI(TAG, "TE 撕裂同步已就绪 (GPIO%d, 上升沿)", LCD_PIN_TE);
     return ESP_OK;
 }
@@ -198,6 +216,12 @@ esp_err_t lcd_init(esp_lcd_panel_handle_t *ret_panel,
     esp_lcd_panel_io_spi_config_t io_cfg = QSPI_AMOLED_PANEL_IO_QSPI_CONFIG(
         LCD_PIN_CS, lcd_color_trans_done_cb, NULL);
     io_cfg.pclk_hz = LCD_QSPI_PCLK_HZ;
+    /* 注意：不要打开 flags.psram_dma_direct！
+     * 实测 IDF 5.5 下打开后第一次 flush 就挂死（DMA 完成/缓存同步路径不通），
+     * 表现为系统还活着（IMU/心跳正常）但 UI 永久卡住。
+     * 内部 RAM 不够的问题改由「LVGL 帧缓冲放内部 DMA RAM」解决（见 ui_manager.cpp），
+     * 这样驱动直接 DMA、完全不做临时 bounce 分配。 */
+    io_cfg.flags.psram_dma_direct = 0;
 
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_SPI_HOST,
                                                  &io_cfg, &io_handle),
@@ -263,7 +287,19 @@ esp_err_t lcd_draw_bitmap_sync(int x_start, int y_start, int x_end, int y_end,
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* 丢掉上一次可能残留的完成信号，避免把"上一块传完"误当成本次完成 */
+    /* 上一次超时遗留的传输可能还没结束：先把它真正的完成信号吃掉，
+     * 否则它会冒充「本次传输完成」，让下面的等待瞬间返回（假成功）。
+     * 注意 tx_param(CASET) 内部会 portMAX_DELAY 排空在途事务，
+     * 因此这里等不到就说明总线真的卡住了，跳过本次刷新更安全。 */
+    if (s_trans_pending) {
+        if (xSemaphoreTake(s_trans_done_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+            ESP_LOGE(TAG, "上一次传输仍未完成，跳过本次刷新");
+            return ESP_ERR_TIMEOUT;
+        }
+        s_trans_pending = false;
+    }
+
+    /* 丢掉更早的残留信号，避免把"上一块传完"误当成本次完成 */
     while (xSemaphoreTake(s_trans_done_sem, 0) == pdTRUE) {
     }
 
@@ -274,6 +310,7 @@ esp_err_t lcd_draw_bitmap_sync(int x_start, int y_start, int x_end, int y_end,
     }
 
     if (xSemaphoreTake(s_trans_done_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        s_trans_pending = true;
         ESP_LOGW(TAG, "等待 DMA 完成超时 (%u ms)", (unsigned)timeout_ms);
         return ESP_ERR_TIMEOUT;
     }
@@ -312,19 +349,20 @@ bool lcd_te_sync_enabled(void)
 
 esp_err_t lcd_te_sync_set(bool enable)
 {
-    if (enable && !s_te_sem) {
-        esp_err_t err = lcd_te_sync_init();
-        if (err != ESP_OK && err != ESP_ERR_NOT_SUPPORTED) {
-            return err;
-        }
-    }
-    if (s_te_sem) {
-        if (enable) {
-            gpio_intr_enable((gpio_num_t)LCD_PIN_TE);
+    if (enable) {
+        if (!s_te_isr_installed) {
+            esp_err_t err = lcd_te_sync_init();
+            if (err != ESP_OK) {
+                /* 初始化成功时内部已经打开了中断 */
+                return err;
+            }
         } else {
-            gpio_intr_disable((gpio_num_t)LCD_PIN_TE);
+            gpio_intr_enable((gpio_num_t)LCD_PIN_TE);
         }
+    } else if (s_te_isr_installed) {
+        gpio_intr_disable((gpio_num_t)LCD_PIN_TE);
     }
+
     s_te_sync_on = enable;
     s_te_timeout_cnt = 0;
     return ESP_OK;
@@ -346,6 +384,13 @@ esp_err_t lcd_show_test_pattern(esp_lcd_panel_handle_t panel)
     const int W = LCD_H_RES;
     const int H = LCD_V_RES;
     const size_t px_count = W * H;
+
+    /* ⚠ 本函数只能用在 lcd_init() 之后、ui_manager_init() 之前（点亮验证阶段）。
+     * 它直接独占面板句柄绘制，与 LVGL 的 flush 抢同一个 panel IO 会互相打断。 */
+    if (!s_panel || panel != s_panel) {
+        ESP_LOGE(TAG, "测试图案必须在 lcd_init() 之后、UI 启动之前调用");
+        return ESP_ERR_INVALID_STATE;
+    }
 
     /* 用 PSRAM 分配整屏缓冲（460*460*2 = 423KB） */
     uint16_t *buf = (uint16_t *)heap_caps_malloc(px_count * sizeof(uint16_t),
@@ -390,17 +435,15 @@ esp_err_t lcd_show_test_pattern(esp_lcd_panel_handle_t panel)
         }
     }
 
-    /* 分带提交：整屏一次 draw_bitmap 会被拆成 13 个 SPI 事务（每块 ≤32KB），
-     * 而本驱动没有开 flags.psram_dma_direct，PSRAM 缓冲会经内部 DMA bounce buffer 中转，
-     * 排队中的事务最多占用 10 x 32KB = 320KB 内部 RAM → 很容易 ESP_ERR_NO_MEM。
-     * 按 46 行一条带提交（和 LVGL 的分带刷新一致），内部缓冲峰值只有约 43KB。 */
+    /* 分带提交：整屏一次 draw_bitmap 会被拆成 13 个 SPI 事务（每块 ≤32KB）。
+     * 现已打开 flags.psram_dma_direct，DMA 直接用 PSRAM 缓冲、不再申请内部
+     * bounce buffer；这里仍按 46 行一条带提交，和 LVGL 分带刷新保持一致。 */
     const int BAND_LINES = 46;
     esp_err_t err = ESP_OK;
     for (int y = 0; y < H && err == ESP_OK; y += BAND_LINES) {
         int y_end = (y + BAND_LINES > H) ? H : (y + BAND_LINES);
         err = lcd_draw_bitmap_sync(0, y, W, y_end, buf + (size_t)y * W, 500);
     }
-    (void)panel;
 
     heap_caps_free(buf);
     ESP_LOGI(TAG, "测试图案绘制%s", (err == ESP_OK) ? "完成" : "失败");

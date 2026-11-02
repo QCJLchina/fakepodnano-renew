@@ -1,125 +1,120 @@
 /**
- * FAKE_POD_NANO 桌面主页（2x2 宫格大触控卡片）
+ * FAKE_POD_NANO 桌面主页（2x2 宫格大卡片）
  * ============================================
- * 依据 UI_DESIGN_SPEC.md 第三节：
- *   卡片1 正在播放  -> 本地播放器页 (UI_VIEW_PLAYER)
- *   卡片2 音乐目录  -> 暂未实现，弹提示
- *   卡片3 USB DAC  -> USB 声卡页 (UI_VIEW_UAC)
- *   卡片4 系统设置  -> 暂未实现，弹提示
- * 开机默认停在此页。
+ * 视觉基准：prototype/index.html 的 .status-bar / .launcher-grid / .launcher-card
+ *          → design_ref/launcher.png（460x460 设计截图，2x 渲染）。
  *
- * 中文显示依赖 ui_fonts.h 里的自定义 CJK 字体（20px 标题 / 16px 正文）。
+ * 版式（页面内边距 18 / 14，全部来自 ui_theme.h 的令牌，本文件不写死颜色和像素）：
+ *   状态栏  (18,14) 424x24：左 %H:%M；右 CS43131(强调色) + VOL nn%(次级) + ⚡ nn%
+ *   宫格    205x183 四张，间距 14，起点 (18,46)：
+ *             (18,46) 正在播放 → 播放器页    (237,46) 音乐目录 → 目录页
+ *             (18,243) USB DAC → USB 模式页  (237,243) 系统设置 → 设置页
+ *   手势条  60x4 底部居中（ui_gesture_hint_create）
+ *
+ * 卡片内部（图标左上 / 文字左下）由通用控件 ui_launcher_card_create 统一绘制，
+ * 本页只负责摆放与动态文案，不再自己重排卡片内容。
+ *
+ * 动态数据由 ui_manager 每 200ms 调一次 ui_view_home_update()：
+ *   时钟（未校时 --:--）/ 音量（audio_pipeline_get_volume）/ 电量（battery_percent）
+ *   / 卡片1 副标题（当前曲目名）。
  */
 
 #include "ui_view_home.h"
+
 #include "ui_manager.h"
-#include "ui_fonts.h"
+#include "ui_theme.h"
 #include "ui_view_files.h"
-#include "player_service.h"
-#include "usb_uac_service.h"
+
+#include "audio_pipeline.h"
 #include "battery_service.h"
+#include "player_service.h"
+#include "esp_log.h"
 
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
 
-static lv_obj_t *s_screen_home = NULL;
-static lv_obj_t *s_lbl_clock = NULL;      /* 顶部时间 */
-static lv_obj_t *s_lbl_bat = NULL;        /* 顶部电量 */
-static lv_obj_t *s_lbl_now = NULL;        /* 卡片1副标题：当前曲目 */
-static lv_obj_t *s_lbl_toast = NULL;      /* 底部临时提示 */
-static lv_obj_t *s_lbl_touch_warn = NULL; /* 触摸未就绪提示 */
-static lv_timer_t *s_toast_timer = NULL;
-
 /* ---------------------------------------------------------------
- * 底部临时提示（2 秒后自动消失）
+ * 页面内对象
  * --------------------------------------------------------------- */
-static void toast_timeout_cb(lv_timer_t *t)
-{
-    if (s_lbl_toast) lv_label_set_text(s_lbl_toast, " ");
-    lv_timer_pause(t);
-}
+static lv_obj_t *s_screen      = NULL;
+static lv_obj_t *s_lbl_clock   = NULL;  /* 状态栏左：时间 */
+static lv_obj_t *s_lbl_vol     = NULL;  /* 状态栏右：VOL nn% */
+static lv_obj_t *s_lbl_bat     = NULL;  /* 状态栏右：nn%（⚡ 由状态栏控件画） */
+static lv_obj_t *s_lbl_now     = NULL;  /* 卡片1 副标题：当前曲目 */
+static lv_obj_t *s_lbl_touch   = NULL;  /* 触摸未就绪提示（次级灰小字） */
 
-static void show_toast(const char *msg)
-{
-    if (!s_lbl_toast) return;
-    lv_label_set_text(s_lbl_toast, msg);
-    if (!s_toast_timer) {
-        s_toast_timer = lv_timer_create(toast_timeout_cb, 2000, NULL);
-    } else {
-        lv_timer_reset(s_toast_timer);
-        lv_timer_resume(s_toast_timer);
-    }
-}
+/* 副标题未播放时的默认文案（对应设计稿空状态） */
+#define HOME_NOW_PLAYING_IDLE "点按开始播放"
 
 /* ---------------------------------------------------------------
  * 卡片点击回调
  * --------------------------------------------------------------- */
-static void card_now_click_cb(lv_event_t *e)
+static void card_playing_cb(lv_event_t *e)
 {
     (void)e;
     ui_switch_view(UI_VIEW_PLAYER);
 }
 
-static void card_dir_click_cb(lv_event_t *e)
+static void card_files_cb(lv_event_t *e)
 {
     (void)e;
-    ui_view_files_enter();          /* 重置到 TF 卡根目录并刷新列表 */
+    ui_view_files_enter();              /* 重置到 TF 卡根目录并刷新列表 */
     ui_switch_view(UI_VIEW_FILES);
 }
 
-static void card_dac_click_cb(lv_event_t *e)
+static void card_uac_cb(lv_event_t *e)
 {
     (void)e;
-    /* 进入 USB 模式选择页：DAC 声卡 / U盘模式 */
-    ui_switch_view(UI_VIEW_USB_MODE);
+    ESP_LOGI("HOME", "主页卡片 3 (USB DAC / 模式) 被点击 -> 切换至 USB 模式选择页");
+    ui_switch_view(UI_VIEW_USB_MODE);   /* USB 模式：DAC 声卡 / U 盘 */
 }
 
-static void card_set_click_cb(lv_event_t *e)
+static void card_settings_cb(lv_event_t *e)
 {
     (void)e;
     ui_switch_view(UI_VIEW_SETTINGS);
 }
 
 /* ---------------------------------------------------------------
- * 创建一张宫格卡片（图标 + 标题 + 副标题，纵向居中）
- * 返回卡片对象；副标题是最后一个子对象，可用 lv_obj_get_child(card, -1) 取到
+ * 当前曲目 → 卡片副标题
+ *
+ * 设计稿卡片1 副标题只显示曲名（"加州旅馆"）。player_service 的
+ * audio_track_info_t 目前只带格式/时长，不带标题/艺术家元数据，
+ * 所以统一按常见命名 "标题 - 艺术家 (后缀)" 从文件名推：
+ *   /sdcard/欧美发烧经典原盘/加州旅馆 - Eagles (Live).flac -> 加州旅馆
+ * 没有分隔符则整个文件名（去扩展名）。
  * --------------------------------------------------------------- */
-static lv_obj_t* make_card(lv_obj_t *parent, const char *icon, const char *title,
-                           const char *sub, lv_event_cb_t cb)
+static void home_now_playing_text(char *out, size_t out_len, const player_status_t *st)
 {
-    lv_obj_t *card = lv_btn_create(parent);
-    lv_obj_set_size(card, 190, 170);
-    lv_obj_set_style_radius(card, 18, 0);
-    lv_obj_set_style_bg_color(card, lv_color_make(18, 18, 23), 0);
-    lv_obj_set_style_bg_grad_color(card, lv_color_make(32, 27, 20), 0);
-    lv_obj_set_style_bg_grad_dir(card, LV_GRAD_DIR_VER, 0);
-    lv_obj_set_style_border_width(card, 1, 0);
-    lv_obj_set_style_border_color(card, lv_color_make(72, 54, 26), 0);
-    lv_obj_set_style_shadow_width(card, 0, 0);
-    lv_obj_set_style_pad_all(card, 10, 0);
-    lv_obj_set_style_pad_row(card, 6, 0);
-    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_add_event_cb(card, cb, LV_EVENT_CLICKED, NULL);
+    if (!out || out_len < 2) return;
+    out[0] = '\0';
 
-    lv_obj_t *ico = lv_label_create(card);
-    lv_obj_set_style_text_font(ico, &lv_font_montserrat_32, 0);
-    lv_obj_set_style_text_color(ico, lv_palette_main(LV_PALETTE_AMBER), 0);
-    lv_label_set_text(ico, icon);
+    const char *path = st->current_path;
+    const char *name = strrchr(path, '/');
+    name = name ? (name + 1) : path;
+    if (!name || !*name) return;
 
-    lv_obj_t *t = lv_label_create(card);
-    lv_obj_set_style_text_font(t, &ui_font_cjk_20, 0);
-    lv_obj_set_style_text_color(t, lv_color_white(), 0);
-    lv_label_set_text(t, title);
+    /* 去掉扩展名 */
+    size_t n = strlen(name);
+    const char *dot = strrchr(name, '.');
+    if (dot && dot != name) n = (size_t)(dot - name);
+    if (n >= out_len) n = out_len - 1;
+    if (n == 0) return;
 
-    lv_obj_t *s = lv_label_create(card);
-    lv_obj_set_style_text_font(s, &ui_font_cjk_16, 0);
-    lv_obj_set_style_text_color(s, lv_color_make(150, 150, 165), 0);
-    lv_obj_set_style_max_width(s, 170, 0);
-    lv_label_set_text(s, sub);
+    /* "标题 - 艺术家"：只取标题部分，与设计稿一致 */
+    size_t len = n;
+    for (size_t i = 0; i + 2 < n; i++) {
+        if (name[i] == ' ' && name[i + 1] == '-' && name[i + 2] == ' ') {
+            len = i;
+            break;
+        }
+    }
+    while (len > 0 && name[len - 1] == ' ') len--;
+    if (len == 0) len = n;
 
-    return card;
+    memcpy(out, name, len);
+    out[len] = '\0';
 }
 
 /* ---------------------------------------------------------------
@@ -127,122 +122,136 @@ static lv_obj_t* make_card(lv_obj_t *parent, const char *icon, const char *title
  * --------------------------------------------------------------- */
 lv_obj_t* ui_view_home_create(void)
 {
-    s_screen_home = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(s_screen_home, lv_color_black(), 0);
-    lv_obj_set_style_border_width(s_screen_home, 0, 0);
+    s_screen = ui_screen_create();      /* 纯黑 460x460，内边距 0，绝对定位 */
 
-    /* 顶部状态栏：时间 + 硬件标识 */
-    s_lbl_clock = lv_label_create(s_screen_home);
-    lv_obj_set_style_text_font(s_lbl_clock, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(s_lbl_clock, lv_color_white(), 0);
-    lv_label_set_text(s_lbl_clock, "--:--");
-    lv_obj_align(s_lbl_clock, LV_ALIGN_TOP_LEFT, 20, 8);
+    /* 顶部状态栏：(18,14) 424x24，左时间 / 右 CS43131 + VOL + ⚡ 电量 */
+    ui_home_status_bar_create(s_screen, &s_lbl_clock, &s_lbl_vol, &s_lbl_bat);
 
-    lv_obj_t *hw = lv_label_create(s_screen_home);
-    lv_obj_set_style_text_font(hw, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(hw, lv_color_make(140, 140, 155), 0);
-    lv_label_set_text(hw, "CS43131 Hi-Fi");
-    lv_obj_align(hw, LV_ALIGN_TOP_MID, 0, 10);
+    /* 2x2 宫格：205x183，间距 14，起点 (18,46) */
+    ui_launcher_card_create(s_screen, UI_GRID_X, UI_GRID_Y,
+                            &ui_icon_music,
+                            UI_GRAD_PLAYING_A, UI_GRAD_PLAYING_B,
+                            "正在播放", HOME_NOW_PLAYING_IDLE,
+                            card_playing_cb, &s_lbl_now);
 
-    /* 电量显示（右上角） */
-    s_lbl_bat = lv_label_create(s_screen_home);
-    lv_obj_set_style_text_font(s_lbl_bat, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(s_lbl_bat, lv_color_make(140, 140, 155), 0);
-    lv_label_set_text(s_lbl_bat, LV_SYMBOL_BATTERY_EMPTY);
-    lv_obj_align(s_lbl_bat, LV_ALIGN_TOP_RIGHT, -20, 10);
+    ui_launcher_card_create(s_screen, UI_GRID_X + UI_CARD_W + UI_CARD_GAP, UI_GRID_Y,
+                            &ui_icon_folder,
+                            UI_GRAD_FILES_A, UI_GRAD_FILES_B,
+                            "音乐目录", "TF卡 / 专辑 / 无损",
+                            card_files_cb, NULL);
 
-    /* 2x2 宫格卡片 */
-    lv_obj_t *c1 = make_card(s_screen_home, LV_SYMBOL_PLAY, "正在播放", "点按进入播放器", card_now_click_cb);
-    lv_obj_align(c1, LV_ALIGN_TOP_LEFT, 26, 38);
-    s_lbl_now = lv_obj_get_child(c1, -1);
+    ui_launcher_card_create(s_screen, UI_GRID_X, UI_GRID_Y + UI_CARD_H + UI_CARD_GAP,
+                            &ui_icon_headset,
+                            UI_GRAD_UAC_A, UI_GRAD_UAC_B,
+                            "USB DAC", "最高 384kHz/32bit",
+                            card_uac_cb, NULL);
 
-    lv_obj_t *c2 = make_card(s_screen_home, LV_SYMBOL_DIRECTORY, "音乐目录", "TF 卡 / 文件夹", card_dir_click_cb);
-    lv_obj_align(c2, LV_ALIGN_TOP_RIGHT, -26, 38);
+    ui_launcher_card_create(s_screen, UI_GRID_X + UI_CARD_W + UI_CARD_GAP,
+                            UI_GRID_Y + UI_CARD_H + UI_CARD_GAP,
+                            &ui_icon_gear,
+                            UI_GRAD_SETTINGS_A, UI_GRAD_SETTINGS_B,
+                            "系统设置", "屏幕亮度 / 休眠 / 关于",
+                            card_settings_cb, NULL);
 
-    lv_obj_t *c3 = make_card(s_screen_home, LV_SYMBOL_USB, "USB 模式", "DAC / U盘", card_dac_click_cb);
-    lv_obj_align(c3, LV_ALIGN_BOTTOM_LEFT, 26, -66);
+    /* 卡片1 副标题会被动态改写（曲名），改成省略号收尾，防止长文件名溢出色块 */
+    if (s_lbl_now) lv_label_set_long_mode(s_lbl_now, LV_LABEL_LONG_DOT);
 
-    lv_obj_t *c4 = make_card(s_screen_home, LV_SYMBOL_SETTINGS, "系统设置", "亮度 / 休眠", card_set_click_cb);
-    lv_obj_align(c4, LV_ALIGN_BOTTOM_RIGHT, -26, -66);
+    /* 底部手势提示条（60x4，居中，距底 6px） */
+    ui_gesture_hint_create(s_screen);
 
-    /* 底部手势提示条 + 临时提示文字 */
-    lv_obj_t *hint = lv_obj_create(s_screen_home);
-    lv_obj_set_size(hint, 120, 4);
-    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -8);
-    lv_obj_set_style_radius(hint, 2, 0);
-    lv_obj_set_style_bg_color(hint, lv_color_make(80, 80, 95), 0);
-    lv_obj_set_style_border_width(hint, 0, 0);
+    /* 触摸未就绪提示：底部一行次级灰小字（现场没有串口时也能一眼看出来） */
+    s_lbl_touch = ui_label_create(s_screen, "触摸未就绪 / 仅显示", UI_FONT_CJK_S, UI_COL_TEXT3);
+    lv_obj_set_width(s_lbl_touch, UI_SCR_W - UI_PAD_X * 2);
+    lv_label_set_long_mode(s_lbl_touch, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(s_lbl_touch, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_lbl_touch, LV_ALIGN_BOTTOM_MID, 0, -(UI_HINT_H + 8));
+    lv_obj_add_flag(s_lbl_touch, LV_OBJ_FLAG_HIDDEN);
 
-    s_lbl_toast = lv_label_create(s_screen_home);
-    lv_obj_set_style_text_font(s_lbl_toast, &ui_font_cjk_16, 0);
-    lv_obj_set_style_text_color(s_lbl_toast, lv_palette_main(LV_PALETTE_AMBER), 0);
-    lv_label_set_text(s_lbl_toast, " ");
-    lv_obj_align(s_lbl_toast, LV_ALIGN_BOTTOM_MID, 0, -20);
-
-    /* 触摸初始化失败时的可见提示（无串口时也能看出问题） */
-    s_lbl_touch_warn = lv_label_create(s_screen_home);
-    lv_obj_set_style_text_font(s_lbl_touch_warn, &ui_font_cjk_16, 0);
-    lv_obj_set_style_text_color(s_lbl_touch_warn, lv_palette_main(LV_PALETTE_RED), 0);
-    lv_label_set_text(s_lbl_touch_warn, "触摸未就绪");
-    lv_obj_align(s_lbl_touch_warn, LV_ALIGN_BOTTOM_MID, 0, -40);
-    lv_obj_add_flag(s_lbl_touch_warn, LV_OBJ_FLAG_HIDDEN);
-
-    return s_screen_home;
+    return s_screen;
 }
 
 /* ---------------------------------------------------------------
- * 周期刷新：时钟 + 卡片1当前曲目
+ * 周期刷新（ui_manager 每 200ms 调用一次）
  * --------------------------------------------------------------- */
 void ui_view_home_update(void)
 {
-    if (!s_screen_home) return;
+    if (!s_screen) return;
 
-    /* 触摸未就绪时在底部显示红字提示 */
-    if (s_lbl_touch_warn) {
+    /* 触摸状态：没就绪时显示底部灰字提示 */
+    if (s_lbl_touch) {
         if (ui_touch_ok()) {
-            lv_obj_add_flag(s_lbl_touch_warn, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_lbl_touch, LV_OBJ_FLAG_HIDDEN);
         } else {
-            lv_obj_clear_flag(s_lbl_touch_warn, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(s_lbl_touch, LV_OBJ_FLAG_HIDDEN);
         }
     }
 
-    /* 时钟：时间未校准时显示 --:-- */
-    time_t now = time(NULL);
-    struct tm tm_info;
-    if (now > 1600000000 && localtime_r(&now, &tm_info)) {
+    /* 时钟：未校时（1970 那一档）显示 --:-- */
+    if (s_lbl_clock) {
+        time_t now = time(NULL);
+        struct tm tm_info;
         char buf[8];
-        strftime(buf, sizeof(buf), "%H:%M", &tm_info);
-        lv_label_set_text(s_lbl_clock, buf);
-    } else {
-        lv_label_set_text(s_lbl_clock, "--:--");
-    }
-
-    /* 电量：约每 5 秒刷新一次（避免频繁 ADC 读取） */
-    static int bat_tick = 0;
-    if (s_lbl_bat && (++bat_tick >= 25)) {
-        bat_tick = 0;
-        int p = battery_percent();
-        char bb[32];
-        if (p >= 0) {
-            const char *sym = (p > 70) ? LV_SYMBOL_BATTERY_FULL :
-                              (p > 35) ? LV_SYMBOL_BATTERY_2 : LV_SYMBOL_BATTERY_1;
-            snprintf(bb, sizeof(bb), "%s %d%%", sym, p);
+        if (now > 1600000000 && localtime_r(&now, &tm_info)) {
+            strftime(buf, sizeof(buf), "%H:%M", &tm_info);
         } else {
-            snprintf(bb, sizeof(bb), "%s --", LV_SYMBOL_BATTERY_EMPTY);
+            snprintf(buf, sizeof(buf), "--:--");
         }
-        lv_label_set_text(s_lbl_bat, bb);
+        lv_label_set_text(s_lbl_clock, buf);
     }
 
-    /* 卡片1 副标题：有正在播放/暂停的曲目就显示文件名 */
+    /* 音量：audio_pipeline 的真实音量，变化时才刷新 label */
+    if (s_lbl_vol) {
+        static int last_vol = -1;
+        int vol = (int)audio_pipeline_get_volume();
+        if (vol < 0) vol = 0;
+        if (vol > 100) vol = 100;
+        if (vol != last_vol) {
+            char buf[16];
+            last_vol = vol;
+            snprintf(buf, sizeof(buf), "VOL %d%%", vol);
+            lv_label_set_text(s_lbl_vol, buf);
+        }
+    }
+
+    /* 电量：ADC 读取有开销，首次立即读一次、之后每 5 秒一次（25 x 200ms） */
+    if (s_lbl_bat) {
+        static int bat_tick = 25;
+        static int last_bat = -2;
+        if (++bat_tick >= 25) {
+            bat_tick = 0;
+            int pct = battery_percent();
+            if (pct < 0 || pct > 100) pct = -1;
+            if (pct != last_bat) {
+                char buf[16];
+                last_bat = pct;
+                if (pct >= 0) {
+                    snprintf(buf, sizeof(buf), "%d%%", pct);   /* ⚡ 符号由状态栏控件画 */
+                } else {
+                    snprintf(buf, sizeof(buf), "--");
+                }
+                lv_label_set_text(s_lbl_bat, buf);
+            }
+        }
+    }
+
+    /* 卡片1 副标题：有当前曲目就显示曲名，完全没曲目显示"点按开始播放" */
     if (s_lbl_now) {
+        static char last[80] = { 0 };
+        char title[80];
         player_status_t st;
+
         player_get_status(&st);
-        if (st.state != PLAYER_STATE_STOPPED && st.current_path[0]) {
-            const char *fname = strrchr(st.current_path, '/');
-            fname = fname ? (fname + 1) : st.current_path;
-            lv_label_set_text(s_lbl_now, fname);
+        if (st.state == PLAYER_STATE_STOPPED || st.state == PLAYER_STATE_ERROR ||
+            !st.current_path[0]) {
+            snprintf(title, sizeof(title), "%s", HOME_NOW_PLAYING_IDLE);
         } else {
-            lv_label_set_text(s_lbl_now, "点按进入播放器");
+            home_now_playing_text(title, sizeof(title), &st);
+            if (!title[0]) snprintf(title, sizeof(title), "%s", HOME_NOW_PLAYING_IDLE);
+        }
+
+        if (strcmp(title, last) != 0) {
+            snprintf(last, sizeof(last), "%s", title);
+            lv_label_set_text(s_lbl_now, title);
         }
     }
 }

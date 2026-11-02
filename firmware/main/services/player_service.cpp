@@ -28,6 +28,7 @@ static player_status_t s_status = {
 };
 
 static SemaphoreHandle_t s_mutex = NULL;
+static play_mode_t s_play_mode = PLAY_MODE_REPEAT_ALL;
 static TaskHandle_t s_task_handle = NULL;
 static FILE *s_current_file = NULL;
 static AudioDecoder *s_decoder = NULL;
@@ -183,6 +184,13 @@ static void player_task(void *arg)
                 }
                 player_release_output();
                 xSemaphoreGive(s_mutex);
+
+                if (s_play_mode == PLAY_MODE_REPEAT_ONE) {
+                    player_play(s_status.current_path);
+                } else {
+                    player_next();
+                }
+                continue;
             }
         } else {
             /* 暂停或停止状态下休眠等待 */
@@ -283,8 +291,9 @@ static esp_err_t play_sibling(int step)
     while ((ent = readdir(dp)) != NULL && count < max_tracks) {
         if (ent->d_name[0] == '.') continue;
         if (!svc_name_playable(ent->d_name)) continue;
-        strncpy(names + count * name_len, ent->d_name, name_len - 1);
-        names[count * name_len + (name_len - 1)] = '\0';
+        size_t nl = strnlen(ent->d_name, (size_t)name_len - 1);
+        memcpy(names + count * name_len, ent->d_name, nl);
+        names[count * name_len + nl] = '\0';
         count++;
     }
     closedir(dp);
@@ -297,7 +306,14 @@ static esp_err_t play_sibling(int step)
             if (!strcmp(names + i * name_len, base)) { idx = i; break; }
         }
         if (idx < 0) idx = 0;
-        int ni = (idx + step + count) % count;
+        int ni = 0;
+        if (s_play_mode == PLAY_MODE_SHUFFLE && count > 1) {
+            int r = rand() % count;
+            if (r == idx) r = (r + 1) % count;
+            ni = r;
+        } else {
+            ni = (idx + step + count) % count;
+        }
         char full[512];
         snprintf(full, sizeof(full), "%s/%s", dir, names + ni * name_len);
         ret = player_play(full);
@@ -356,6 +372,16 @@ esp_err_t player_seek(uint32_t sec)
     s_req_seek = true;
     xSemaphoreGive(s_mutex);
     return ESP_OK;
+}
+
+void player_set_play_mode(play_mode_t mode)
+{
+    s_play_mode = mode;
+}
+
+play_mode_t player_get_play_mode(void)
+{
+    return s_play_mode;
 }
 
 esp_err_t player_set_volume(uint8_t vol)

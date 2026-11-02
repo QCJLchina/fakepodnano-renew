@@ -29,7 +29,7 @@
 
 static const char *TAG = "UI_MGR";
 
-#define LVGL_BUF_LINES  (46) /* 1/10 屏幕高度缓冲 */
+#define LVGL_BUF_LINES  (24) /* 单缓冲，460*24*2 = 22.1KB，放内部 DMA RAM */
 
 static SemaphoreHandle_t s_lvgl_mux = NULL;
 static lv_disp_drv_t s_disp_drv;
@@ -38,6 +38,7 @@ static esp_lcd_panel_handle_t s_panel_handle = NULL;
 static esp_lcd_touch_handle_t s_touch_handle = NULL;
 static bool s_touch_ok = false;
 static uint32_t s_flush_timeout_cnt = 0;
+static volatile uint32_t s_flush_cnt = 0;  /* flush 次数，用于 UI 心跳诊断 */
 static bool s_flush_needs_te = true;   /* 本刷新周期的第一块数据是否还等着对齐 TE */
 
 static lv_obj_t *s_screen_home = NULL;
@@ -122,9 +123,9 @@ static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t 
         }
     }
 
-    /* 同步提交：必须等这块缓冲区的 QSPI DMA 真正传完，才能告诉 LVGL「这块可以复用了」。
-     * 旧写法是 draw_bitmap() 之后立刻 flush_ready()，DMA 还在读缓冲区时 LVGL 就已经
-     * 把下一帧画进同一块内存 —— 这是滚屏/动画花屏、横向撕裂的直接原因。 */
+    /* 同步提交：color 缓冲是内部 DMA 内存，SPI 驱动直接对它做 DMA，不再拷贝，
+     * 所以必须等 DMA 真正传完才能 flush_ready 把缓冲交还 LVGL，否则下一帧 CPU
+     * 写入会与 DMA 读同一块内存（真实竞态）。横向撕裂由下面的 TE 对齐消除。 */
     esp_err_t err = lcd_draw_bitmap_sync(area->x1, area->y1,
                                         area->x2 + 1, area->y2 + 1,
                                         color_map, LCD_FLUSH_TIMEOUT_MS);
@@ -137,6 +138,7 @@ static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t 
     }
 
     /* 即使超时也必须调用，否则 LVGL 会永久卡在等这块缓冲区 */
+    s_flush_cnt++;
     lv_disp_flush_ready(drv);
 }
 
@@ -208,10 +210,21 @@ static void lvgl_task(void *arg)
     ESP_LOGI(TAG, "LVGL 渲染引擎任务已启动 (Core 0)");
 
     uint32_t timer_cnt = 0;
+    int64_t last_hb_us = 0;
     while (1) {
         uint32_t delay_ms = 10;
         if (ui_lock(100)) {
             delay_ms = lv_timer_handler();
+
+            /* UI 存活心跳：区分「UI 线程卡死」和「只是慢」 */
+            int64_t now_us = esp_timer_get_time();
+            if (now_us - last_hb_us > 5000000) {
+                last_hb_us = now_us;
+                ESP_LOGI(TAG, "UI 心跳: flush=%u 内部堆=%uKB 总堆=%uKB",
+                         (unsigned)s_flush_cnt,
+                         (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+                         (unsigned)(esp_get_free_heap_size() / 1024));
+            }
 
             /* 每 200ms 刷新当前前台页面的状态数据 */
             timer_cnt += delay_ms;
@@ -310,17 +323,20 @@ esp_err_t ui_manager_init(esp_lcd_panel_handle_t panel, esp_lcd_panel_io_handle_
     /* 1. 初始化 LVGL 库 */
     lv_init();
 
-    /* 2. 在 PSRAM 中分配双帧缓冲区 (460 * 46 * 2 = 42.3KB 每块)
-     *    ESP32-S3 的 SPI DMA 能直接读 PSRAM，放 PSRAM 没问题；
-     *    安全性依赖 flush_cb 里「等 DMA 完成再 flush_ready」，不要改回异步提交。 */
+    /* 2. 帧缓冲放【内部 DMA RAM】（单缓冲，460 * 24 * 2 = 22.1KB）
+     *    原因：PSRAM 缓冲 + psram_dma_direct=0 时，SPI 驱动每次 flush 都要在内部
+     *    RAM 里再申请一块同样大的 bounce buffer（46 行≈43KB）；内部 RAM 碎片化后
+     *    直接 ESP_ERR_NO_MEM → 花屏/卡死。而 psram_dma_direct=1 在 IDF 5.5 上实测
+     *    会挂死第一次 flush。改成内部 DMA 缓冲后 esp_ptr_dma_capable()=true，
+     *    驱动直接 DMA、不做任何临时分配；flush_cb 里的同步等待保证不复用竞态。
+     *    单缓冲足够：flush 是同步的，双缓冲本来也拿不到流水重叠。 */
     size_t buf_size = LCD_H_RES * LVGL_BUF_LINES * sizeof(lv_color_t);
-    lv_color_t *buf1 = (lv_color_t*)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    lv_color_t *buf2 = (lv_color_t*)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!buf1 || !buf2) {
-        ESP_LOGE(TAG, "PSRAM 分配 LVGL 渲染缓冲区失败！");
+    lv_color_t *buf1 = (lv_color_t*)heap_caps_malloc(buf_size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (!buf1) {
+        ESP_LOGE(TAG, "内部 DMA 分配 LVGL 渲染缓冲区失败 (%u 字节)！", (unsigned)buf_size);
         return ESP_ERR_NO_MEM;
     }
-    lv_disp_draw_buf_init(&s_disp_buf, buf1, buf2, LCD_H_RES * LVGL_BUF_LINES);
+    lv_disp_draw_buf_init(&s_disp_buf, buf1, NULL, LCD_H_RES * LVGL_BUF_LINES);
 
     /* 3. 注册显示设备驱动 */
     lv_disp_drv_init(&s_disp_drv);
@@ -409,7 +425,7 @@ esp_err_t ui_manager_init(esp_lcd_panel_handle_t panel, esp_lcd_panel_io_handle_
     }
 
     /* 7. 启动常驻渲染线程 (Core 0) */
-    xTaskCreatePinnedToCore(lvgl_task, "lvgl_task", 6144, NULL, 4, NULL, 0);
+    xTaskCreatePinnedToCore(lvgl_task, "lvgl_task", 10240, NULL, 4, NULL, 0);
 
     ESP_LOGI(TAG, "UI 系统初始化完成，全新主界面已点亮！");
     return ESP_OK;

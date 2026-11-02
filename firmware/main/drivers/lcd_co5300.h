@@ -62,9 +62,10 @@ esp_err_t lcd_show_test_pattern(esp_lcd_panel_handle_t panel);
 /**
  * @brief 同步式绘制：提交一块区域，并【等待 QSPI DMA 真正传输完成】再返回
  *
- * 直接调用 esp_lcd_panel_draw_bitmap() 时它是异步的（提交即返回），
- * 若紧接着调用 lv_disp_flush_ready()，LVGL 会立刻把下一帧画进同一块缓冲区，
- * 而 DMA 可能还在读该缓冲区 → 花屏 / 横向撕裂。本函数把这件事做对。
+ * esp_lcd_panel_draw_bitmap() 是异步的（提交即返回）。IDF 文档要求 color 缓冲区的
+ * 复用时刻必须在 on_color_trans_done 之后；直接紧接着调用 lv_disp_flush_ready()
+ * 在「PSRAM 缓冲 + psram_dma_direct=0」时因为内部会 memcpy 而侥幸安全，
+ * 但换成内部 DMA 内存或打开 psram_dma_direct 就是真竞态。本函数按契约做对。
  *
  * @param x_start,y_start  起始坐标（含）
  * @param x_end,y_end      结束坐标（不含）

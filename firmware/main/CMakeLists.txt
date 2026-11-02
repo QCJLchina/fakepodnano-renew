@@ -6,6 +6,7 @@ set(MAIN_SRCS
          "board/board_init.cpp"
          "drivers/lcd_co5300.cpp"
          "drivers/dac_cs43131.cpp"
+         "drivers/dac_cs43131_v2.cpp"
          "drivers/dac_cs43131_v4.cpp"
          "audio/audio_pipeline.cpp"
          "audio/decoder_base.cpp"
@@ -30,6 +31,8 @@ set(MAIN_SRCS
          "ui/ui_view_files.cpp"
          "ui/ui_view_settings.cpp"
          "ui/ui_view_usbmode.cpp"
+         "ui/ui_theme.cpp"
+         "ui/ui_icons.c"
          "ui/fonts/ui_font_cjk_16.c"
          "ui/fonts/ui_font_cjk_20.c"
 )

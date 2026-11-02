@@ -25,7 +25,7 @@ static const char *TAG = "IMU";
 #define QMI_AX_L       0x35
 
 static i2c_master_dev_handle_t s_imu_dev = NULL;
-static volatile bool s_enabled = true;
+static volatile bool s_enabled = false;   /* 手势默认关闭（设置页可手动开） */
 static volatile bool s_present = false;
 
 void imu_service_set_enabled(bool enabled)
@@ -44,10 +44,15 @@ bool imu_service_present(void)
     return s_present;
 }
 
-/* 手势参数（可按实测调整） */
-#define TILT_G           0.45f     /* 倾斜判定阈值(g) */
-#define TILT_HOLD_MS     220       /* 持续倾斜时间 */
-#define TILT_COOLDOWN_MS 600       /* 两次倾斜动作最小间隔 */
+/* 手势参数（可按实测调整）
+ * 注意：机器斜放在桌上时 |gx| 会长期超过阈值，旧参数(0.45g/600ms)会每 0.6 秒
+ * 切一次歌。现在要求：①接近水平(|gz|≥0.70g)才认倾斜；②一次倾斜只触发一次，
+ * 必须先回到中位(|gx|,|gy|<0.20g)才能再次触发；③冷却 1.2 秒。 */
+#define TILT_G           0.50f     /* 倾斜判定阈值(g) */
+#define TILT_FLAT_G      0.70f     /* 只有接近水平(屏幕朝上)才识别倾斜手势 */
+#define TILT_NEUTRAL_G   0.20f     /* 判定"已回中位"的阈值(g) */
+#define TILT_HOLD_MS     400       /* 持续倾斜时间 */
+#define TILT_COOLDOWN_MS 1200      /* 两次倾斜动作最小间隔 */
 #define TAP_G            1.10f     /* 敲击：合加速度偏离 1g 的阈值(g) */
 #define TAP_DOUBLE_MS    400       /* 双击窗口 */
 
@@ -105,6 +110,7 @@ static void imu_task(void *arg)
 
     int tilt_dir = 0;          /* 当前持续倾斜方向: 0无 1左 2右 3上 4下 */
     int64_t tilt_since = 0;
+    bool s_tilt_armed = true;  /* 一次倾斜只触发一次，回中位后才重新武装 */
     int64_t last_action = 0;
     int64_t last_tap = 0;
     int tap_count = 0;
@@ -165,29 +171,43 @@ static void imu_task(void *arg)
             tap_count = 0;
         }
 
-        /* 倾斜检测（仅播放页响应） */
-        int dir = 0;
-        if (gx > TILT_G) dir = 1;        /* 左倾(待校准) */
-        else if (gx < -TILT_G) dir = 2;  /* 右倾 */
-        else if (gy > TILT_G) dir = 3;   /* 上倾 */
-        else if (gy < -TILT_G) dir = 4;  /* 下倾 */
+        /* 倾斜检测（仅播放页响应）：
+         * 必须接近水平才识别（斜放/侧放不触发）；一次倾斜只响应一次，
+         * 需要先回中位才允许下一次，避免持续倾斜导致连续切歌。 */
+        bool flat = fabsf(gz) >= TILT_FLAT_G;
+        bool neutral = (fabsf(gx) < TILT_NEUTRAL_G) && (fabsf(gy) < TILT_NEUTRAL_G);
 
-        if (dir != tilt_dir) {
-            tilt_dir = dir;
+        if (!flat || neutral) {
+            s_tilt_armed = true;      /* 回到水平/中位 → 允许下一次动作 */
+            tilt_dir = 0;
             tilt_since = now;
-        } else if (dir != 0 && (now - tilt_since) >= TILT_HOLD_MS &&
-                   (now - last_action) >= TILT_COOLDOWN_MS) {
-            if (ui_get_current_view() == UI_VIEW_PLAYER) {
-                player_status_t st;
-                player_get_status(&st);
-                int v = st.volume;
-                if (dir == 1) { player_prev(); ESP_LOGI(TAG, "手势: 左倾 → 上一曲"); }
-                else if (dir == 2) { player_next(); ESP_LOGI(TAG, "手势: 右倾 → 下一曲"); }
-                else if (dir == 3) { v = (v + 5 > 100) ? 100 : v + 5; player_set_volume((uint8_t)v); ESP_LOGI(TAG, "手势: 上倾 → 音量 %d%%", v); }
-                else if (dir == 4) { v = (v - 5 < 0) ? 0 : v - 5; player_set_volume((uint8_t)v); ESP_LOGI(TAG, "手势: 下倾 → 音量 %d%%", v); }
+        } else if (s_tilt_armed) {
+            int dir = 0;
+            if (gx > TILT_G) dir = 1;        /* 左倾 */
+            else if (gx < -TILT_G) dir = 2;  /* 右倾 */
+            else if (gy > TILT_G) dir = 3;   /* 上倾 */
+            else if (gy < -TILT_G) dir = 4;  /* 下倾 */
+
+            if (dir == 0) {
+                tilt_dir = 0;
+                tilt_since = now;
+            } else if (dir != tilt_dir) {
+                tilt_dir = dir;
+                tilt_since = now;
+            } else if ((now - tilt_since) >= TILT_HOLD_MS &&
+                       (now - last_action) >= TILT_COOLDOWN_MS) {
+                if (ui_get_current_view() == UI_VIEW_PLAYER) {
+                    player_status_t st;
+                    player_get_status(&st);
+                    int v = st.volume;
+                    if (dir == 1) { player_prev(); ESP_LOGI(TAG, "手势: 左倾 → 上一曲"); }
+                    else if (dir == 2) { player_next(); ESP_LOGI(TAG, "手势: 右倾 → 下一曲"); }
+                    else if (dir == 3) { v = (v + 5 > 100) ? 100 : v + 5; player_set_volume((uint8_t)v); ESP_LOGI(TAG, "手势: 上倾 → 音量 %d%%", v); }
+                    else if (dir == 4) { v = (v - 5 < 0) ? 0 : v - 5; player_set_volume((uint8_t)v); ESP_LOGI(TAG, "手势: 下倾 → 音量 %d%%", v); }
+                }
+                last_action = now;
+                s_tilt_armed = false;   /* 一次倾斜只触发一次 */
             }
-            last_action = now;
-            tilt_since = now;
         }
     }
 }

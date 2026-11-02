@@ -17,6 +17,8 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "driver/i2s_std.h"
 #include "driver/gpio.h"
 
@@ -26,25 +28,48 @@ static i2s_chan_handle_t s_tx_chan = NULL;
 static SemaphoreHandle_t s_lock = NULL;
 static audio_owner_t s_owner = AUDIO_OWNER_NONE;
 static audio_format_t s_current_fmt = {
-    .sample_rate = 44100,       /* 硬件固定 44.1k（本板唯一确认可出声的配置） */
+    .sample_rate = 44100,       /* 本地播放统一 44.1k/16bit 输出（本板实测唯一可出声档） */
     .bits_per_sample = 16,
     .channels = 2,
 };
 static uint8_t s_current_volume = 80;
 static bool s_is_muted = false;
 
-/* ---------------- 统一输出格式（任意 PCM → 44.1k/16bit/立体声） ---------------- */
+/* ---------------- 输出格式策略 ----------------
+ * 本地播放：**统一输出 16bit / 44.1kHz**（不管源 FLAC 是 16/24bit、
+ *   44.1/48/88.2/96/192k，一律软件重采样成 16bit/44.1k 再送 CS43131）。
+ *   44.1k/16bit 是本板唯一实测确认能出声的档位；48k 实测无声（CS43131 ASP
+ *   在 48k 下的分频/时序还没调通），所以固定用 44.1k。
+ * USB 声卡（AUDIO_OWNER_UAC）：仍按主机下发的采样率/位深直通（≤96k）。
+ * DoP（176.4k/24bit）作为例外直通，不做重采样。
+ */
 #define OUT_RATE_FIXED     44100
+#define OUT_RATE_HI        96000
 #define OUT_CHANNELS_FIXED 2
+
+/* 硬件可直接输出的采样率（I2S 主时钟 256×fs，CS43131 分频档 a5 已覆盖） */
+static bool hw_rate_supported(uint32_t rate)
+{
+    return rate == 44100 || rate == 48000 || rate == 88200 || rate == 96000;
+}
+
+/* 硬件可直接输出的字长：16 bit 走 16-bit slot，24/32 bit 走 32-bit slot */
+static bool hw_bits_supported(uint8_t bits)
+{
+    return bits == 16 || bits == 24 || bits == 32;
+}
 
 static audio_format_t s_src_fmt = {
     .sample_rate = OUT_RATE_FIXED,
     .bits_per_sample = 16,
     .channels = OUT_CHANNELS_FIXED,
 };
+static uint32_t s_conv_rate = OUT_RATE_FIXED;  /* 需要重采样时的目标采样率 */
 static bool   s_conv_enabled = false;
 static double s_src_pos = 0.0;          /* 重采样相位（可跨块为负） */
 static int32_t s_prev[2] = { 0, 0 };    /* 上一块最后一帧，用于跨块插值 */
+static int16_t *s_conv_buf = NULL;      /* 重采样输出缓冲：复用，避免每块 malloc 打碎内部堆 */
+static size_t   s_conv_cap = 0;         /* 当前容量（样本数，含双声道） */
 
 /* 前置声明：均衡器系数重算（reconfig 中调用，定义在文件后部） */
 static void eq_recompute(void);
@@ -139,8 +164,8 @@ static esp_err_t i2s_driver_setup(const audio_format_t *fmt)
 {
     /* 1. 通道分配（启用 TX 通道，使用 APLL 获得高保真超低抖动音频时钟） */
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num = 8;
-    chan_cfg.dma_frame_num = 512;
+    chan_cfg.dma_desc_num = 6;
+    chan_cfg.dma_frame_num = 256;   /* 32bit 槽位时单缓冲 2KB，6 个共 12KB 内部 DMA */
     chan_cfg.auto_clear = true;
 
     esp_err_t ret = i2s_new_channel(&chan_cfg, &s_tx_chan, NULL);
@@ -208,8 +233,13 @@ esp_err_t audio_pipeline_init(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* 1. 初始化 CS43131 硬件与模拟链路 */
-    esp_err_t ret = cs43131_init_v4(i2c_bus, s_current_fmt.sample_rate);
+    /* 1. 初始化 CS43131 硬件与模拟链路
+     * 用 v2（按 Linux cs43130 驱动的完整上电时序）而不是 v4：
+     *   - v4 切外部 24.576MHz 时钟（本板实测切完 I2C 失联/无声），且没关耳机检测；
+     *   - v2 留在内部 RCO 22.5792MHz（正好供 44.1k 族），关掉 HP_DETECT，
+     *     并补了 DXD13/DXD2/DXD14/DXD15 的耳放与模拟上电时序。 */
+    esp_err_t ret = cs43131_init_vendor(i2c_bus, s_current_fmt.sample_rate,
+                                        (uint8_t)s_current_fmt.bits_per_sample);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "CS43131 初始化失败: %s", esp_err_to_name(ret));
         return ret;
@@ -271,19 +301,49 @@ esp_err_t audio_pipeline_reconfig(const audio_format_t *fmt)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* 源格式 → 硬件固定输出 44.1k/16bit/立体声；不一致时启用软件重采样。
-     * DoP（176.4k）必须直通，不能重采样。 */
+    /* 本地播放 → 一律 16bit/44.1k；USB 声卡 → 主机格式（≤96k 直通）；DoP 直通。
+     * 其余情况（单声道、非标准帧率、>96k 的非播放源）重采样到 44.1k 或 96k。 */
     audio_format_t src = *fmt;
-    bool need_conv = !(src.sample_rate == OUT_RATE_FIXED &&
-                       src.bits_per_sample == 16 &&
-                       src.channels == OUT_CHANNELS_FIXED);
-    if (src.sample_rate == 176400) need_conv = false;
+    bool native = hw_rate_supported(src.sample_rate) &&
+                  hw_bits_supported(src.bits_per_sample) &&
+                  src.channels == OUT_CHANNELS_FIXED;
+    bool need_conv = !native;
+    /* DoP（176.4k / 24bit / 立体声）必须直通：重采样会破坏 0x05/0xFA 标记 */
+    bool dsd_dop = (src.sample_rate == 176400 &&
+                    src.bits_per_sample == 24 &&
+                    src.channels == OUT_CHANNELS_FIXED);
+
+    /* 本地播放：统一输出 44.1k/16bit；源本来就是 44.1k/16bit 立体声则直通 */
+    bool fixed_playback = (s_owner == AUDIO_OWNER_PLAYER);
+    if (fixed_playback) {
+        need_conv = !(src.sample_rate == OUT_RATE_FIXED &&
+                      src.bits_per_sample == 16 &&
+                      src.channels == OUT_CHANNELS_FIXED);
+    }
+    if (dsd_dop) need_conv = false;
+
+    /* 安全阀：24/32bit 直通需要 32-bit 槽位，I2S DMA 缓冲会翻倍。内部 DMA 池不够时
+     * IDF 的 i2s_channel_reconfig_std_slot() 分配失败后还会空指针解引用 → 直接重启。
+     * 所以先检查内部 DMA 可用量，不够就降级成 16bit 重采样输出。 */
+    if (!need_conv && src.bits_per_sample > 16) {
+        size_t dma_free = heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        if (dma_free < 40 * 1024) {
+            ESP_LOGW(TAG, "内部 DMA 内存不足(%uKB)，%u bit 直通降级为 16bit 重采样",
+                     (unsigned)(dma_free / 1024), (unsigned)src.bits_per_sample);
+            need_conv = true;
+        }
+    }
 
     audio_format_t hw = src;
     if (need_conv) {
-        hw.sample_rate = OUT_RATE_FIXED;
+        s_conv_rate = fixed_playback
+                        ? OUT_RATE_FIXED
+                        : ((src.sample_rate > OUT_RATE_HI) ? OUT_RATE_HI : OUT_RATE_FIXED);
+        hw.sample_rate = s_conv_rate;
         hw.bits_per_sample = 16;
         hw.channels = OUT_CHANNELS_FIXED;
+    } else {
+        s_conv_rate = src.sample_rate;
     }
 
     if (s_src_fmt.sample_rate == src.sample_rate &&
@@ -338,8 +398,18 @@ esp_err_t audio_pipeline_reconfig(const audio_format_t *fmt)
 
     i2c_master_bus_handle_t i2c_bus = board_i2c_bus_get();
     if (i2c_bus) {
-        cs43131_set_sample_rate(i2c_bus, fmt->sample_rate);
-        cs43131_set_sample_bits(i2c_bus, fmt->bits_per_sample);
+        /* 44.1k/16bit 是 init_v2 已经配好的档位，不必再重下发 ASP 表；
+         * 其它格式（USB 声卡）才需要重新配置 DAC 串口。 */
+        bool dac_same = (fmt->sample_rate == 44100 && fmt->bits_per_sample == 16);
+        if (!dac_same) {
+            /* 采样率切换不能只改 0x01000B(a5)：原厂 ASP 表里 0x040011/13/15/17 与
+             * 0x050000/0x050001 都是 a5 的副本，不同步重写会让 NUM/DEN 与 LRCK
+             * 不匹配，表现为变调/失真/无声。cs43131_set_stream() 会整表重下发。 */
+            cs43131_set_stream(fmt->sample_rate, fmt->bits_per_sample);
+        }
+        /* 音量/静音再确认一次，避免被意外静音 */
+        cs43131_set_volume(i2c_bus, s_current_volume);
+        cs43131_set_mute(i2c_bus, s_is_muted);
     }
 
     esp_err_t ret = i2s_channel_disable(s_tx_chan);
@@ -478,9 +548,8 @@ static const void *eq_process(const void *data, size_t size_bytes, size_t *out_l
 }
 
 /* ---------------------------------------------------------------
- * 统一输出格式：任意 PCM → 44.1kHz / 16bit / 立体声
- * 原因：本板 CS43131 只在 44.1k/16bit（原厂 ASP 参数）下确认可出声，
- *       其他采样率/位深由软件重采样后统一输出。
+ * 保底重采样：仅在源格式超出硬件能力时启用（目标见 s_conv_rate）
+ * 硬件的原生直通能力见 hw_rate_supported() / hw_bits_supported()。
  * --------------------------------------------------------------- */
 static inline int32_t src_sample_at(const void *base, int32_t idx, int ch, const audio_format_t *f)
 {
@@ -492,7 +561,9 @@ static inline int32_t src_sample_at(const void *base, int32_t idx, int ch, const
     }
     const int32_t *p = (const int32_t *)base;
     int32_t v = p[(size_t)idx * f->channels + c];
-    if (f->bits_per_sample == 24) return v >> 8;    /* 24in32 左对齐 */
+    /* 24bit / 32bit 样本在内存里都是"左对齐 32 位"（解码器已 <<8 / 原样）。
+     * 输出是 int16，要取最高 16 位 → 统一右移 16。
+     * （之前 24bit 只移 8 位，得到的是 24bit 量级，再被 clamp 削顶 → 呲啦啦噪声） */
     return v >> 16;
 }
 
@@ -506,7 +577,7 @@ static size_t conv_to_fixed(const void *data, size_t in_bytes, int16_t *out, siz
     uint32_t n = (uint32_t)(in_bytes / bpf);
     if (n == 0) return 0;
 
-    double ratio = (double)f->sample_rate / (double)OUT_RATE_FIXED;
+    double ratio = (double)f->sample_rate / (double)s_conv_rate;
     size_t o = 0;
     while (o + 2 <= out_cap_samples) {
         int32_t i0 = (int32_t)floor(s_src_pos);
@@ -546,26 +617,27 @@ esp_err_t audio_pipeline_write(const void *data, size_t size_bytes, size_t *byte
     s_writers++;
     portEXIT_CRITICAL(&s_phase_mux);
 
-    int16_t *conv_buf = NULL;
     const void *out = data;
     size_t out_len = size_bytes;
 
     if (s_conv_enabled) {
         size_t bpf = (((s_src_fmt.bits_per_sample == 16) ? 2 : 4) * s_src_fmt.channels);
         size_t in_frames = bpf ? (size_bytes / bpf) : 0;
-        double ratio = (double)s_src_fmt.sample_rate / (double)OUT_RATE_FIXED;
+        double ratio = (double)s_src_fmt.sample_rate / (double)s_conv_rate;
         size_t out_frames = (size_t)(ratio > 0.0 ? ((double)in_frames / ratio) : 0.0) + 16;
-        conv_buf = (int16_t *)malloc(out_frames * OUT_CHANNELS_FIXED * sizeof(int16_t));
-        if (conv_buf) {
-            size_t got = conv_to_fixed(data, size_bytes, conv_buf,
-                                       out_frames * OUT_CHANNELS_FIXED);
-            out = conv_buf;
+        size_t need = out_frames * OUT_CHANNELS_FIXED;
+        if (need > s_conv_cap) {
+            int16_t *nb = (int16_t *)realloc(s_conv_buf, need * sizeof(int16_t));
+            if (nb) { s_conv_buf = nb; s_conv_cap = need; }
+        }
+        if (s_conv_buf && s_conv_cap >= need) {
+            size_t got = conv_to_fixed(data, size_bytes, s_conv_buf, need);
+            out = s_conv_buf;
             out_len = got * sizeof(int16_t);
         }
     }
 
     if (out_len == 0) {
-        free(conv_buf);
         portENTER_CRITICAL(&s_phase_mux);
         s_writers--;
         portEXIT_CRITICAL(&s_phase_mux);
@@ -578,7 +650,29 @@ esp_err_t audio_pipeline_write(const void *data, size_t size_bytes, size_t *byte
 
     esp_err_t ret = i2s_channel_write(s_tx_chan, eq_out, eq_len, bytes_written, pdMS_TO_TICKS(timeout_ms));
 
-    free(conv_buf);
+    /* 诊断：每 2 秒打印写入量、I2S 返回值、样本峰值（0 峰值=送进去就是静音） */
+    {
+        static int64_t s_last_pcm_log = 0;
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - s_last_pcm_log >= 2000000) {
+            s_last_pcm_log = now_us;
+            int peak = 0;
+            if (s_current_fmt.bits_per_sample == 16 && eq_len >= 2) {
+                const int16_t *sp = (const int16_t *)eq_out;
+                size_t n = eq_len / 2;
+                if (n > 4096) n = 4096;
+                for (size_t i = 0; i < n; i++) {
+                    int v = sp[i]; if (v < 0) v = -v;
+                    if (v > peak) peak = v;
+                }
+            }
+            ESP_LOGI(TAG, "PCM 诊断: 送 %u B, 写回 %u B, ret=%s, 峰值=%d, 输出 %lu Hz/%dbit",
+                     (unsigned)eq_len, (unsigned)(bytes_written ? *bytes_written : 0),
+                     esp_err_to_name(ret), peak,
+                     (unsigned long)s_current_fmt.sample_rate, s_current_fmt.bits_per_sample);
+        }
+    }
+
     portENTER_CRITICAL(&s_phase_mux);
     s_writers--;
     portEXIT_CRITICAL(&s_phase_mux);
@@ -636,11 +730,11 @@ esp_err_t audio_pipeline_play_test_tone(uint32_t freq_hz, uint32_t ms, uint8_t v
     audio_pipeline_set_mute(false);
     audio_pipeline_set_volume(volume_pct);
 
-    /* 硬件固定 44.1k/16bit：先做一次完整初始化（复位/晶振/耳放/音量/静音），
+    /* 统一 44.1k/16bit 输出：先做一次完整初始化（复位/晶振/耳放/音量/静音），
      * 再输出 1kHz 正弦。音质档位不再扫描——任何源格式都由 write 层重采样。 */
     i2c_master_bus_handle_t bus = board_i2c_bus_get();
     if (bus) {
-        cs43131_init_v4(bus, OUT_RATE_FIXED);
+        cs43131_init_v2(bus, OUT_RATE_FIXED, 16);
     }
 
     audio_format_t fmt = {
@@ -683,4 +777,28 @@ esp_err_t audio_pipeline_play_test_tone(uint32_t freq_hz, uint32_t ms, uint8_t v
     audio_pipeline_release(AUDIO_OWNER_PLAYER);
     ESP_LOGI(TAG, "组合轮播结束：哪一组是干净正弦音请反馈组号 1~4");
     return ESP_OK;
+}
+
+/* ---------------------------------------------------------------
+ * bring-up 诊断：依次套用 5 种 DAC 初始化档位，各播 1.2s 1kHz 测试音。
+ * 用途：在真实硬件上确定 CS43131 能出声的配置，避免继续盲改。
+ * --------------------------------------------------------------- */
+extern "C" void audio_pipeline_dac_probe(void)
+{
+    /* 实测：bit2（外部 24.576M 时钟）会让 CS43131 I2C 立刻失联，必须排除 */
+    static const int profiles[] = {0, 1, 2, 3};
+    const int n = (int)(sizeof(profiles) / sizeof(profiles[0]));
+    for (int i = 0; i < n; i++) {
+        int p = profiles[i];
+        cs43131_set_probe_profile(p);
+        ESP_LOGI(TAG, "=== DAC 探测 %d/%d profile=%d [%s%s%s] 播 1kHz ===",
+                 i + 1, n, p,
+                 (p & 1) ? "v4帧编码 " : "",
+                 (p & 2) ? "开耳机检测 " : "",
+                 (p & 4) ? "外部24.576M " : "");
+        audio_pipeline_play_test_tone(1000, 1200, 70);
+        vTaskDelay(pdMS_TO_TICKS(400));
+    }
+    cs43131_set_probe_profile(0);
+    ESP_LOGI(TAG, "=== DAC 探测结束（恢复 profile 0）===");
 }

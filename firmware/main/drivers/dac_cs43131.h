@@ -54,6 +54,12 @@ esp_err_t cs43131_init(i2c_master_bus_handle_t i2c_bus);
 esp_err_t cs43131_init_v2(i2c_master_bus_handle_t i2c_bus, uint32_t sample_rate, uint8_t bits);
 
 /**
+ * @brief 原厂初始化序列复刻（从 OTA 反汇编逐条提取的寄存器写入顺序）。
+ *        用于对齐原厂固件真实使用的声音通路配置。
+ */
+esp_err_t cs43131_init_vendor(i2c_master_bus_handle_t i2c_bus, uint32_t sample_rate, uint8_t bits);
+
+/**
  * @brief 依照 AUDIO_CHAIN.md 逆向结果实现的初始化（v4）：
  *        探测 0x30~0x33 + DevId 校验 → 上电 → 晶振起振(清 bit3/bit4,
  *        等 INT_STATUS1.bit3) → 切 24.576MHz 外部时钟 → 原厂 16 项 ASP 表
@@ -74,6 +80,12 @@ int cs43131_clock_count(void);
 
 /** @brief 按采样率/位深配置串口与 ASP（44.1k/16bit 为已确认可用基准档） */
 esp_err_t cs43131_set_stream(uint32_t sample_rate, uint8_t bits);
+
+/**
+ * @brief 设置 v2 初始化的探测档位（bit0=用 v4 的 16bit 帧编码，bit1=打开耳机检测，
+ *        bit2=切外部 24.576MHz 时钟）。仅用于 bring-up 扫描，默认 0。
+ */
+void cs43131_set_probe_profile(int profile);
 
 /**
  * @brief 按音频位宽重新配置 DAC 的串口位宽/通道位宽/ASP 分频

@@ -23,6 +23,9 @@
 #include "battery_service.h"
 #include "imu_service.h"
 #include "usb_msc_dev.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
+#include "driver/gpio.h"
 
 static const char *TAG = "MAIN";
 
@@ -37,8 +40,32 @@ extern "C" void app_main(void)
         esp_err_t msc_err = usb_msc_mode_start();
         ESP_LOGI(TAG, "U盘模式启动%s", (msc_err == ESP_OK) ? "成功（插电脑应出现可移动磁盘）" : "失败（见上方日志）");
     }
+    /* 预设下次开机或重启时自动切回 app0 主播放器系统 */
+    const esp_partition_t *main_part = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
+    if (main_part) {
+        esp_ota_set_boot_partition(main_part);
+        ESP_LOGI(TAG, "下次启动已预设切回主播放器固件 (app0)");
+    }
+
+    /* 配置物理按键 (GPIO48 功能键 / GPIO0 电源键)，按任意按键退出 U 盘模式并重启回主系统 */
+    gpio_config_t btn_cfg = {
+        .pin_bit_mask = (1ULL << 48) | (1ULL << 0),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&btn_cfg);
+
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (gpio_get_level((gpio_num_t)48) == 0 || gpio_get_level((gpio_num_t)0) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(120));
+            if (gpio_get_level((gpio_num_t)48) == 0 || gpio_get_level((gpio_num_t)0) == 0) {
+                ESP_LOGI(TAG, "检测到按键按下，退出 U 盘模式并重启回到主播放器...");
+                esp_restart();
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 #endif
 

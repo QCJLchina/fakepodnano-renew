@@ -26,6 +26,12 @@ typedef enum {
     PLAYER_STATE_ERROR,
 } player_state_t;
 
+typedef enum {
+    PLAY_MODE_REPEAT_ALL = 0,  /* 列表循环 (默认) */
+    PLAY_MODE_REPEAT_ONE,      /* 单曲循环 */
+    PLAY_MODE_SHUFFLE,         /* 随机播放 */
+} play_mode_t;
+
 typedef struct {
     player_state_t state;
     char current_path[256];
@@ -65,6 +71,12 @@ esp_err_t player_stop(void);
  */
 esp_err_t player_next(void);
 esp_err_t player_prev(void);
+
+/**
+ * @brief 播放模式控制（列表循环 / 单曲循环 / 随机播放）
+ */
+void player_set_play_mode(play_mode_t mode);
+play_mode_t player_get_play_mode(void);
 
 /**
  * @brief 跳转到目标秒数

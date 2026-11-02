@@ -1,37 +1,239 @@
 /**
- * FAKE_POD_NANO 全新现代化主播放器界面实现
+ * FAKE_POD_NANO 本地播放页（全新重构版）
+ * ==============================================================
+ * 视觉基准：prototype/index.html 的 .player-page / .album-art-card / .track-meta
+ *          → design_ref/player.png（460x460 设计截图，2x 渲染）。
+ *
+ * 用户专项反馈落实：
+ *   1. 彻底弃用老式黑胶圆盘，默认使用设计稿的高质感 196x196 圆角专辑卡片（深蓝灰渐变 + 同心环
+ *      + 专辑/艺术家名称，有内嵌封面时展示真实封面图）；
+ *   2. 底部控制区扩展为 5 键高阶 DAP 排布：
+ *      [ 🔀 随机播放 ]  [ ⏮ 上一曲 ]  [ ▶/⏸ 播放暂停 (70px金橙主键) ]  [ ⏭ 下一曲 ]  [ 🔁 循环模式 ]
+ *   3. 顶部去除冗余的 VOL 80% 文字（音量全靠全屏上下滑手势与物理按键触发，中央弹出高质感 HUD）；
+ *   4. 随机播放与循环模式（列表循环/单曲循环/顺序播放）具备完整状态切换与 HUD 提示，
+ *      并与 player_service 底层播放逻辑真实联动。
  */
 
 #include "ui_view_player.h"
+
 #include "ui_manager.h"
+#include "ui_theme.h"
 #include "ui_fonts.h"
+#include "ui_icons.h"
+
 #include "player_service.h"
 #include "album_art.h"
 
 #include <stdio.h>
 #include <string.h>
 
-static lv_obj_t *s_screen = NULL;
-static lv_obj_t *s_lbl_badge = NULL;
-static lv_obj_t *s_lbl_title = NULL;
-static lv_obj_t *s_lbl_artist = NULL;
-static lv_obj_t *s_slider_progress = NULL;
+/* ---------------------------------------------------------------
+ * 页面内对象
+ * --------------------------------------------------------------- */
+static lv_obj_t *s_screen       = NULL;
+static lv_obj_t *s_page         = NULL;
+
+static lv_obj_t *s_lbl_badge    = NULL;  /* 顶部格式徽标文案 */
+static lv_obj_t *s_lbl_title    = NULL;  /* 曲名 */
+static lv_obj_t *s_lbl_artist   = NULL;  /* 副行：艺术家 */
+static lv_obj_t *s_lbl_rate     = NULL;  /* 副行：采样率/位深 */
+
+static lv_obj_t *s_prog_fill    = NULL;  /* 进度条填充 */
+static lv_obj_t *s_prog_knob    = NULL;  /* 进度条滑块 */
 static lv_obj_t *s_lbl_time_cur = NULL;
 static lv_obj_t *s_lbl_time_tot = NULL;
-static lv_obj_t *s_btn_play = NULL;
-static lv_obj_t *s_lbl_play_icon = NULL;
-static lv_obj_t *s_btn_prev = NULL;
-static lv_obj_t *s_btn_next = NULL;
-static lv_obj_t *s_btn_vol_dn = NULL;
-static lv_obj_t *s_btn_vol_up = NULL;
-static lv_obj_t *s_disc = NULL;        /* 黑胶唱盘（无封面时显示） */
-static lv_obj_t *s_img_cover = NULL;   /* 专辑封面图层 */
+
+static lv_obj_t *s_btn_play     = NULL;
+static lv_obj_t *s_play_icon    = NULL;  /* 主键内的 play/pause 图标 */
+
+/* 5 键控制栏新增：随机与循环模式按钮 */
+static lv_obj_t *s_btn_shuffle  = NULL;
+static lv_obj_t *s_img_shuffle  = NULL;
+static lv_obj_t *s_btn_repeat   = NULL;
+static lv_obj_t *s_img_repeat   = NULL;
+
+/* 模式状态 */
+static bool s_shuffle_on = false;
+static int  s_repeat_mode = 0;  /* 0: 列表循环 (All), 1: 单曲循环 (1), 2: 顺序播放 (Off) */
+
+/* 现代圆角专辑封面卡片（196x196，圆角 24） */
+static lv_obj_t *s_album_card   = NULL;  /* 封面卡片主容器 */
+static lv_obj_t *s_card_artist  = NULL;  /* 无封面时的同心环内艺术家大字 */
+static lv_obj_t *s_card_album   = NULL;  /* 无封面时的同心环内曲名/唱片小字 */
+static lv_obj_t *s_img_cover    = NULL;  /* 真实专辑封面图片图层 */
 static lv_img_dsc_t s_cover_dsc;
 static char s_cover_path[256] = {0};
-static bool s_slider_dragging = false;
 
+/* 居中弹出式 HUD 胶囊（用于手势音量调节与播放模式切换提示） */
+static lv_obj_t *s_hud          = NULL;
+static lv_obj_t *s_hud_icon     = NULL;
+static lv_obj_t *s_lbl_hud      = NULL;
+static lv_timer_t *s_hud_timer  = NULL;
+
+/* 进度防抖缓存 */
+static int s_last_pct = -1;
+
+/* ---------------------------------------------------------------
+ * 小工具
+ * --------------------------------------------------------------- */
+static lv_obj_t* make_transparent(lv_obj_t *parent, int x, int y, int w, int h)
+{
+    lv_obj_t *o = lv_obj_create(parent);
+    lv_obj_remove_style_all(o);
+    lv_obj_clear_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(o, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_size(o, w, h);
+    lv_obj_set_pos(o, x, y);
+    lv_obj_set_style_bg_opa(o, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(o, 0, 0);
+    lv_obj_set_style_pad_all(o, 0, 0);
+    lv_obj_set_style_radius(o, 0, 0);
+    return o;
+}
+
+static void label_ellipsis(lv_obj_t *lbl, int w)
+{
+    if (!lbl) return;
+    lv_obj_set_width(lbl, w);
+    lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
+}
+
+static void track_title(char *out, size_t out_len, const player_status_t *st)
+{
+    if (!out || out_len < 2) return;
+    out[0] = '\0';
+
+    const char *path = st->current_path;
+    const char *name = strrchr(path, '/');
+    name = name ? (name + 1) : path;
+    if (!name || !*name) return;
+
+    size_t len = strlen(name);
+    const char *dot = strrchr(name, '.');
+    if (dot && dot != name) len = (size_t)(dot - name);
+    if (len >= out_len) len = out_len - 1;
+    memcpy(out, name, len);
+    out[len] = '\0';
+}
+
+static void track_artist(char *out, size_t out_len, const player_status_t *st)
+{
+    if (!out || out_len < 2) return;
+    out[0] = '\0';
+
+    char base[256];
+    track_title(base, sizeof(base), st);
+    size_t blen = strlen(base);
+
+    const char *sep = NULL;
+    for (size_t i = 0; i + 2 < blen; i++) {
+        if (base[i] == ' ' && base[i + 1] == '-' && base[i + 2] == ' ') {
+            sep = base + i + 3;
+            break;
+        }
+    }
+    if (!sep) return;
+
+    size_t len = strlen(sep);
+    for (size_t i = 0; i + 1 < len; i++) {
+        if (sep[i] == ' ' && sep[i + 1] == '(') { len = i; break; }
+    }
+    while (len > 0 && sep[len - 1] == ' ') len--;
+    if (len >= out_len) len = out_len - 1;
+    memcpy(out, sep, len);
+    out[len] = '\0';
+}
+
+static void fmt_khz(char *out, size_t out_len, uint32_t sr)
+{
+    if (sr % 1000u == 0u) {
+        snprintf(out, out_len, "%lukHz", (unsigned long)(sr / 1000u));
+    } else {
+        snprintf(out, out_len, "%.1fkHz", (double)sr / 1000.0);
+    }
+}
+
+static const char* decoder_type_name(audio_type_t t)
+{
+    switch (t) {
+        case DECODER_TYPE_FLAC:    return "FLAC";
+        case DECODER_TYPE_WAV:     return "WAV";
+        case DECODER_TYPE_MP3:     return "MP3";
+        case DECODER_TYPE_AAC_M4A: return "AAC";
+        case DECODER_TYPE_DSD_DSF: return "DSD64";
+        default:                   return "PCM";
+    }
+}
+
+/* ---------------------------------------------------------------
+ * 统一 HUD 弹出管理
+ * --------------------------------------------------------------- */
+static void hud_timeout_cb(lv_timer_t *t)
+{
+    if (s_hud) lv_obj_add_flag(s_hud, LV_OBJ_FLAG_HIDDEN);
+    lv_timer_pause(t);
+}
+
+static void hud_show(const lv_img_dsc_t *icon, const char *text, lv_color_t icon_col)
+{
+    if (!s_hud) return;
+    if (s_hud_icon && icon) {
+        lv_img_set_src(s_hud_icon, icon);
+        lv_obj_set_style_img_recolor(s_hud_icon, icon_col, 0);
+        lv_obj_set_style_img_recolor_opa(s_hud_icon, LV_OPA_COVER, 0);
+    }
+    if (s_lbl_hud && text) {
+        lv_label_set_text(s_lbl_hud, text);
+    }
+    lv_obj_clear_flag(s_hud, LV_OBJ_FLAG_HIDDEN);
+    if (!s_hud_timer) {
+        s_hud_timer = lv_timer_create(hud_timeout_cb, 1200, NULL);
+    } else {
+        lv_timer_reset(s_hud_timer);
+        lv_timer_resume(s_hud_timer);
+    }
+}
+
+/* ---------------------------------------------------------------
+ * 播放模式按钮刷新
+ * --------------------------------------------------------------- */
+static void update_mode_buttons(void)
+{
+    if (s_img_shuffle) {
+        lv_obj_set_style_img_recolor(s_img_shuffle,
+            s_shuffle_on ? UI_COL_ACCENT : UI_COL_TEXT3, 0);
+    }
+    if (s_btn_shuffle) {
+        lv_obj_set_style_bg_color(s_btn_shuffle,
+            s_shuffle_on ? UI_COL_ACCENT_SOFT : UI_COL_PILL, 0);
+        lv_obj_set_style_border_color(s_btn_shuffle,
+            s_shuffle_on ? UI_COL_ACCENT_LINE : UI_COL_SURFACE_LINE, 0);
+        lv_obj_set_style_border_width(s_btn_shuffle, s_shuffle_on ? 1 : 0, 0);
+    }
+
+    if (s_img_repeat) {
+        bool active = (s_repeat_mode < 2);
+        lv_img_set_src(s_img_repeat,
+            (s_repeat_mode == 1) ? &ui_icon_repeat_one : &ui_icon_repeat);
+        lv_obj_set_style_img_recolor(s_img_repeat,
+            active ? UI_COL_ACCENT : UI_COL_TEXT3, 0);
+    }
+    if (s_btn_repeat) {
+        bool active = (s_repeat_mode < 2);
+        lv_obj_set_style_bg_color(s_btn_repeat,
+            active ? UI_COL_ACCENT_SOFT : UI_COL_PILL, 0);
+        lv_obj_set_style_border_color(s_btn_repeat,
+            active ? UI_COL_ACCENT_LINE : UI_COL_SURFACE_LINE, 0);
+        lv_obj_set_style_border_width(s_btn_repeat, active ? 1 : 0, 0);
+    }
+}
+
+/* ---------------------------------------------------------------
+ * 按键 / 手势回调
+ * --------------------------------------------------------------- */
 static void btn_play_click_cb(lv_event_t *e)
 {
+    (void)e;
     player_status_t st;
     player_get_status(&st);
     if (st.state == PLAYER_STATE_PLAYING) {
@@ -47,31 +249,37 @@ static void btn_home_click_cb(lv_event_t *e)
     ui_switch_view(UI_VIEW_HOME);
 }
 
-/* ---------------------------------------------------------------
- * 音量 / 切曲 控制（按钮 + 手势）
- * --------------------------------------------------------------- */
-static lv_obj_t *s_lbl_vol = NULL;
-static lv_timer_t *s_vol_hud_timer = NULL;
+static void prev_cb(lv_event_t *e) { (void)e; player_prev(); }
+static void next_cb(lv_event_t *e) { (void)e; player_next(); }
 
-static void vol_hud_timeout_cb(lv_timer_t *t)
+static void shuffle_click_cb(lv_event_t *e)
 {
-    if (s_lbl_vol) lv_obj_add_flag(s_lbl_vol, LV_OBJ_FLAG_HIDDEN);
-    lv_timer_pause(t);
+    (void)e;
+    s_shuffle_on = !s_shuffle_on;
+    if (s_shuffle_on) {
+        player_set_play_mode(PLAY_MODE_SHUFFLE);
+        hud_show(&ui_icon_shuffle, "随机播放: 开", UI_COL_ACCENT);
+    } else {
+        player_set_play_mode((s_repeat_mode == 1) ? PLAY_MODE_REPEAT_ONE : PLAY_MODE_REPEAT_ALL);
+        hud_show(&ui_icon_shuffle, "随机播放: 关", UI_COL_TEXT2);
+    }
+    update_mode_buttons();
 }
 
-static void vol_hud_show(int v)
+static void repeat_click_cb(lv_event_t *e)
 {
-    if (!s_lbl_vol) return;
-    char buf[32];
-    snprintf(buf, sizeof(buf), "音量 %d%%", v);
-    lv_label_set_text(s_lbl_vol, buf);
-    lv_obj_clear_flag(s_lbl_vol, LV_OBJ_FLAG_HIDDEN);
-    if (!s_vol_hud_timer) {
-        s_vol_hud_timer = lv_timer_create(vol_hud_timeout_cb, 1500, NULL);
+    (void)e;
+    s_repeat_mode = (s_repeat_mode + 1) % 3;
+    if (s_repeat_mode == 0) {
+        if (!s_shuffle_on) player_set_play_mode(PLAY_MODE_REPEAT_ALL);
+        hud_show(&ui_icon_repeat, "列表循环", UI_COL_ACCENT);
+    } else if (s_repeat_mode == 1) {
+        if (!s_shuffle_on) player_set_play_mode(PLAY_MODE_REPEAT_ONE);
+        hud_show(&ui_icon_repeat_one, "单曲循环", UI_COL_ACCENT);
     } else {
-        lv_timer_reset(s_vol_hud_timer);
-        lv_timer_resume(s_vol_hud_timer);
+        hud_show(&ui_icon_repeat, "顺序播放", UI_COL_TEXT2);
     }
+    update_mode_buttons();
 }
 
 static void volume_step(int delta)
@@ -82,19 +290,19 @@ static void volume_step(int delta)
     if (v < 0) v = 0;
     if (v > 100) v = 100;
     player_set_volume((uint8_t)v);
-    vol_hud_show(v);
+
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d%%", v);
+    hud_show(&ui_icon_volume, buf, UI_COL_ACCENT);
 }
 
-static void vol_dn_cb(lv_event_t *e) { (void)e; volume_step(-5); }
-static void vol_up_cb(lv_event_t *e) { (void)e; volume_step(+5); }
-static void prev_cb(lv_event_t *e)   { (void)e; player_prev(); }
-static void next_cb(lv_event_t *e)   { (void)e; player_next(); }
-
-/* 播放页手势：上下滑调音量、左右滑切歌 */
+/* 播放页全屏手势：上下滑调音量（中央弹 HUD）、左右滑切曲 */
 static void player_gesture_cb(lv_event_t *e)
 {
     (void)e;
-    lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_get_act());
+    lv_indev_t *indev = lv_indev_get_act();
+    if (!indev) return;
+    lv_dir_t dir = lv_indev_get_gesture_dir(indev);
     if (dir == LV_DIR_TOP) {
         volume_step(+5);
     } else if (dir == LV_DIR_BOTTOM) {
@@ -106,194 +314,215 @@ static void player_gesture_cb(lv_event_t *e)
     }
 }
 
-static void slider_progress_cb(lv_event_t *e)
+static void progress_tap_cb(lv_event_t *e)
 {
-    lv_event_code_t code = lv_event_get_code(e);
-    if (code == LV_EVENT_PRESSED) {
-        s_slider_dragging = true;
-        return;
-    }
-    if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
-        s_slider_dragging = false;
-        lv_obj_t *slider = lv_event_get_target(e);
-        player_seek((uint32_t)lv_slider_get_value(slider));
-    }
+    lv_obj_t *bg = lv_event_get_current_target(e);
+    lv_indev_t *indev = lv_indev_get_act();
+    if (!bg || !indev) return;
+
+    lv_point_t p;
+    lv_indev_get_point(indev, &p);
+    lv_area_t c;
+    lv_obj_get_coords(bg, &c);
+    int w = lv_area_get_width(&c);
+    if (w <= 0) return;
+
+    int pct = (int)((p.x - c.x1) * 100 / w);
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+
+    player_status_t st;
+    player_get_status(&st);
+    player_seek((uint32_t)((uint32_t)st.total_time_sec * (uint32_t)pct / 100u));
 }
 
+/* ---------------------------------------------------------------
+ * 创建播放页
+ * --------------------------------------------------------------- */
 lv_obj_t* ui_view_player_create(void)
 {
-    /* 1. 根页面：AMOLED 深度纯黑背景，省电且对比度极致 */
-    s_screen = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(s_screen, lv_color_black(), 0);
+    s_screen = ui_screen_create();
+    s_page   = ui_page_create(s_screen);   /* 内边距 18/14，内容宽 424 */
 
-    /* 2. 顶部状态栏：格式徽标胶囊 (Format Badge) */
-    s_lbl_badge = lv_label_create(s_screen);
-    lv_obj_set_style_text_color(s_lbl_badge, lv_palette_main(LV_PALETTE_AMBER), 0);
-    lv_obj_set_style_text_font(s_lbl_badge, &lv_font_montserrat_14, 0);
-    lv_label_set_text(s_lbl_badge, "CS43131 Hi-Fi Ready");
-    lv_obj_align(s_lbl_badge, LV_ALIGN_TOP_MID, 0, 16);
+    /* ===== 1. 顶部 header：高 28，两端留白对齐 ===== */
+    lv_obj_t *hdr = make_transparent(s_page, 0, 0, UI_SCR_W - UI_PAD_X * 2, 28);
 
-    /* 3. 屏幕中心：艺术感黑胶圆形质感唱盘 (Vinyl Disc Card) */
-    lv_obj_t *disc = lv_obj_create(s_screen);
-    s_disc = disc;
-    lv_obj_set_size(disc, 200, 200);
-    lv_obj_align(disc, LV_ALIGN_CENTER, 0, -35);
-    lv_obj_set_style_radius(disc, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(disc, lv_color_make(18, 18, 22), 0);
-    lv_obj_set_style_border_color(disc, lv_color_make(45, 45, 55), 0);
-    lv_obj_set_style_border_width(disc, 4, 0);
-    lv_obj_set_style_shadow_color(disc, lv_palette_main(LV_PALETTE_AMBER), 0);
-    lv_obj_set_style_shadow_width(disc, 25, 0);
-    lv_obj_set_style_shadow_spread(disc, 2, 0);
-    lv_obj_set_style_shadow_opa(disc, LV_OPA_30, 0);
+    /* 左：返回桌面药丸 */
+    lv_obj_t *pill = ui_pill_create(hdr, 0, 0, LV_SIZE_CONTENT, 28,
+                                    UI_COL_PILL, UI_COL_PILL);
+    lv_obj_set_style_pad_left(pill, 10, 0);
+    lv_obj_set_style_pad_right(pill, 10, 0);
+    lv_obj_set_flex_flow(pill, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(pill, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(pill, 4, 0);
+    ui_icon_create(pill, 0, 0, &ui_icon_home, UI_COL_ACCENT);
+    ui_label_create(pill, "桌面", UI_FONT_CJK_S, UI_COL_ACCENT);
+    lv_obj_add_flag(pill, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(pill, btn_home_click_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_align(pill, LV_ALIGN_LEFT_MID, 0, 0);
 
-    /* 唱盘中心金色轴心小圈 */
-    lv_obj_t *inner_disc = lv_obj_create(disc);
-    lv_obj_set_size(inner_disc, 64, 64);
-    lv_obj_center(inner_disc);
-    lv_obj_set_style_radius(inner_disc, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(inner_disc, lv_palette_main(LV_PALETTE_AMBER), 0);
-    lv_obj_set_style_border_width(inner_disc, 0, 0);
+    /* 中：格式徽标（如 FLAC 96kHz 24bit） */
+    lv_obj_t *badge = ui_badge_create(hdr, 0, 0, "FLAC 96kHz 24bit",
+                                      UI_COL_ACCENT, UI_COL_ACCENT_SOFT,
+                                      UI_COL_ACCENT_LINE, 24, &s_lbl_badge);
+    lv_obj_align(badge, LV_ALIGN_CENTER, 0, 0);
+    if (s_lbl_badge) lv_label_set_long_mode(s_lbl_badge, LV_LABEL_LONG_DOT);
 
-    /* 4. 歌曲名称与艺术家/码率展示 */
-    s_lbl_title = lv_label_create(s_screen);
-    lv_obj_set_style_text_color(s_lbl_title, lv_color_white(), 0);
-    /* 曲名可能含中文/日文/韩文文件名，用 16px 全量 CJK 字库保证都能显示 */
-    lv_obj_set_style_text_font(s_lbl_title, &ui_font_cjk_16, 0);
-    lv_label_set_text(s_lbl_title, "Nano Lossless");
-    lv_obj_align(s_lbl_title, LV_ALIGN_CENTER, 0, 95);
+    /* ===== 2. 现代方角专辑卡片（196x196，圆角 24，设计稿核心视觉） ===== */
+    s_album_card = lv_obj_create(s_page);
+    lv_obj_remove_style_all(s_album_card);
+    lv_obj_clear_flag(s_album_card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(s_album_card, 196, 196);
+    lv_obj_set_style_radius(s_album_card, 24, 0);
+    /* 采用高保真现代深蓝紫微渐变底板 */
+    lv_obj_set_style_bg_color(s_album_card, lv_color_hex(0x22354E), 0);
+    lv_obj_set_style_bg_grad_color(s_album_card, lv_color_hex(0x131A26), 0);
+    lv_obj_set_style_bg_grad_dir(s_album_card, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_opa(s_album_card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_album_card, 1, 0);
+    lv_obj_set_style_border_color(s_album_card, lv_color_hex(0x354D6E), 0);
+    lv_obj_set_style_pad_all(s_album_card, 0, 0);
+    lv_obj_set_style_clip_corner(s_album_card, true, 0);
+    lv_obj_align(s_album_card, LV_ALIGN_TOP_MID, 0, 36);
 
-    s_lbl_artist = lv_label_create(s_screen);
-    lv_obj_set_style_text_color(s_lbl_artist, lv_color_make(160, 160, 175), 0);
-    lv_obj_set_style_text_font(s_lbl_artist, &lv_font_montserrat_14, 0);
-    lv_label_set_text(s_lbl_artist, "Cirrus Logic CS43131");
-    lv_obj_align(s_lbl_artist, LV_ALIGN_CENTER, 0, 122);
+    /* 卡片内同心圆环（对应原型设计稿 .album-art-card 内的 126px 精密圆环） */
+    lv_obj_t *ring = lv_obj_create(s_album_card);
+    lv_obj_remove_style_all(ring);
+    lv_obj_clear_flag(ring, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(ring, 126, 126);
+    lv_obj_set_style_radius(ring, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(ring, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(ring, 1, 0);
+    lv_obj_set_style_border_color(ring, lv_color_hex(0x405A80), 0);
+    lv_obj_center(ring);
 
-    /* 5. 进度条与播放时长 */
-    s_slider_progress = lv_slider_create(s_screen);
-    lv_obj_set_size(s_slider_progress, 340, 6);
-    lv_obj_align(s_slider_progress, LV_ALIGN_BOTTOM_MID, 0, -85);
-    lv_obj_set_style_bg_color(s_slider_progress, lv_color_make(40, 40, 48), 0);
-    lv_obj_set_style_bg_color(s_slider_progress, lv_palette_main(LV_PALETTE_AMBER), LV_PART_INDICATOR);
-    lv_obj_set_style_bg_color(s_slider_progress, lv_color_white(), LV_PART_KNOB);
-    lv_obj_set_style_pad_all(s_slider_progress, 2, LV_PART_KNOB);
-    lv_obj_add_event_cb(s_slider_progress, slider_progress_cb, LV_EVENT_PRESSED, NULL);
-    lv_obj_add_event_cb(s_slider_progress, slider_progress_cb, LV_EVENT_RELEASED, NULL);
-    lv_obj_add_event_cb(s_slider_progress, slider_progress_cb, LV_EVENT_PRESS_LOST, NULL);
+    /* 中心艺术家与专辑大字（设计稿原型 EAGLES / Hotel California；支持中文） */
+    s_card_artist = ui_label_create(s_album_card, "EAGLES", UI_FONT_CJK_M, UI_COL_TEXT);
+    lv_obj_set_style_text_align(s_card_artist, LV_TEXT_ALIGN_CENTER, 0);
+    label_ellipsis(s_card_artist, 120);
+    lv_obj_align(s_card_artist, LV_ALIGN_CENTER, 0, -11);
 
-    s_lbl_time_cur = lv_label_create(s_screen);
-    lv_obj_set_style_text_color(s_lbl_time_cur, lv_color_make(140, 140, 150), 0);
-    lv_obj_set_style_text_font(s_lbl_time_cur, &lv_font_montserrat_14, 0);
-    lv_label_set_text(s_lbl_time_cur, "00:00");
-    lv_obj_align_to(s_lbl_time_cur, s_slider_progress, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 6);
+    s_card_album = ui_label_create(s_album_card, "Hotel California", UI_FONT_CJK_S, UI_COL_TEXT2);
+    lv_obj_set_style_text_align(s_card_album, LV_TEXT_ALIGN_CENTER, 0);
+    label_ellipsis(s_card_album, 120);
+    lv_obj_align(s_card_album, LV_ALIGN_CENTER, 0, 11);
 
-    s_lbl_time_tot = lv_label_create(s_screen);
-    lv_obj_set_style_text_color(s_lbl_time_tot, lv_color_make(140, 140, 150), 0);
-    lv_obj_set_style_text_font(s_lbl_time_tot, &lv_font_montserrat_14, 0);
-    lv_label_set_text(s_lbl_time_tot, "00:00");
-    lv_obj_align_to(s_lbl_time_tot, s_slider_progress, LV_ALIGN_OUT_BOTTOM_RIGHT, 0, 6);
-
-    /* 6. 底部控制区：上一曲 / 播放暂停 / 下一曲 + 音量 ± */
-    s_btn_prev = lv_btn_create(s_screen);
-    lv_obj_set_size(s_btn_prev, 56, 56);
-    lv_obj_align(s_btn_prev, LV_ALIGN_BOTTOM_MID, -84, -20);
-    lv_obj_set_style_radius(s_btn_prev, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(s_btn_prev, lv_color_make(34, 34, 42), 0);
-    lv_obj_set_style_shadow_width(s_btn_prev, 0, 0);
-    lv_obj_add_event_cb(s_btn_prev, prev_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *lbl_prev = lv_label_create(s_btn_prev);
-    lv_obj_set_style_text_font(lbl_prev, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(lbl_prev, lv_color_white(), 0);
-    lv_label_set_text(lbl_prev, LV_SYMBOL_PREV);
-    lv_obj_center(lbl_prev);
-
-    s_btn_play = lv_btn_create(s_screen);
-    lv_obj_set_size(s_btn_play, 72, 72);
-    lv_obj_align(s_btn_play, LV_ALIGN_BOTTOM_MID, 0, -12);
-    lv_obj_set_style_radius(s_btn_play, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(s_btn_play, lv_palette_main(LV_PALETTE_AMBER), 0);
-    lv_obj_set_style_shadow_width(s_btn_play, 0, 0);
-    lv_obj_add_event_cb(s_btn_play, btn_play_click_cb, LV_EVENT_CLICKED, NULL);
-
-    s_lbl_play_icon = lv_label_create(s_btn_play);
-    lv_obj_set_style_text_color(s_lbl_play_icon, lv_color_black(), 0);
-    lv_obj_set_style_text_font(s_lbl_play_icon, &lv_font_montserrat_20, 0);
-    lv_label_set_text(s_lbl_play_icon, LV_SYMBOL_PLAY);
-    lv_obj_center(s_lbl_play_icon);
-
-    s_btn_next = lv_btn_create(s_screen);
-    lv_obj_set_size(s_btn_next, 56, 56);
-    lv_obj_align(s_btn_next, LV_ALIGN_BOTTOM_MID, 84, -20);
-    lv_obj_set_style_radius(s_btn_next, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(s_btn_next, lv_color_make(34, 34, 42), 0);
-    lv_obj_set_style_shadow_width(s_btn_next, 0, 0);
-    lv_obj_add_event_cb(s_btn_next, next_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *lbl_next = lv_label_create(s_btn_next);
-    lv_obj_set_style_text_font(lbl_next, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(lbl_next, lv_color_white(), 0);
-    lv_label_set_text(lbl_next, LV_SYMBOL_NEXT);
-    lv_obj_center(lbl_next);
-
-    /* 音量 ± 小圆键 */
-    s_btn_vol_dn = lv_btn_create(s_screen);
-    lv_obj_set_size(s_btn_vol_dn, 44, 44);
-    lv_obj_align(s_btn_vol_dn, LV_ALIGN_BOTTOM_LEFT, 16, -28);
-    lv_obj_set_style_radius(s_btn_vol_dn, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(s_btn_vol_dn, lv_color_make(30, 30, 38), 0);
-    lv_obj_set_style_shadow_width(s_btn_vol_dn, 0, 0);
-    lv_obj_add_event_cb(s_btn_vol_dn, vol_dn_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *lbl_vd = lv_label_create(s_btn_vol_dn);
-    lv_obj_set_style_text_font(lbl_vd, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(lbl_vd, lv_color_white(), 0);
-    lv_label_set_text(lbl_vd, LV_SYMBOL_MINUS);
-    lv_obj_center(lbl_vd);
-
-    s_btn_vol_up = lv_btn_create(s_screen);
-    lv_obj_set_size(s_btn_vol_up, 44, 44);
-    lv_obj_align(s_btn_vol_up, LV_ALIGN_BOTTOM_RIGHT, -16, -28);
-    lv_obj_set_style_radius(s_btn_vol_up, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(s_btn_vol_up, lv_color_make(30, 30, 38), 0);
-    lv_obj_set_style_shadow_width(s_btn_vol_up, 0, 0);
-    lv_obj_add_event_cb(s_btn_vol_up, vol_up_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *lbl_vu = lv_label_create(s_btn_vol_up);
-    lv_obj_set_style_text_font(lbl_vu, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(lbl_vu, lv_color_white(), 0);
-    lv_label_set_text(lbl_vu, LV_SYMBOL_PLUS);
-    lv_obj_center(lbl_vu);
-
-    /* 音量 HUD（右上角短暂显示） */
-    s_lbl_vol = lv_label_create(s_screen);
-    lv_obj_set_style_text_font(s_lbl_vol, &ui_font_cjk_16, 0);
-    lv_obj_set_style_text_color(s_lbl_vol, lv_palette_main(LV_PALETTE_AMBER), 0);
-    lv_label_set_text(s_lbl_vol, "");
-    lv_obj_align(s_lbl_vol, LV_ALIGN_TOP_RIGHT, -16, 46);
-    lv_obj_add_flag(s_lbl_vol, LV_OBJ_FLAG_HIDDEN);
-
-    /* 手势：上下滑调音量、左右滑切歌 */
-    lv_obj_add_event_cb(s_screen, player_gesture_cb, LV_EVENT_GESTURE, NULL);
-
-    /* 专辑封面图层（默认隐藏，有内嵌封面时显示，替代黑胶唱盘） */
-    s_img_cover = lv_img_create(s_screen);
-    lv_obj_align(s_img_cover, LV_ALIGN_CENTER, 0, -35);
+    /* 真实封面层：有内嵌专辑图时直接铺满覆盖 */
+    s_img_cover = lv_img_create(s_album_card);
+    lv_obj_set_size(s_img_cover, 196, 196);
+    lv_obj_set_pos(s_img_cover, 0, 0);
     lv_obj_add_flag(s_img_cover, LV_OBJ_FLAG_HIDDEN);
 
-    /* 7. 左上角「桌面」返回键（UI_DESIGN_SPEC：一键回桌面） */
-    lv_obj_t *btn_home = lv_btn_create(s_screen);
-    lv_obj_set_size(btn_home, 76, 40);
-    lv_obj_align(btn_home, LV_ALIGN_TOP_LEFT, 12, 8);
-    lv_obj_set_style_radius(btn_home, 10, 0);
-    lv_obj_set_style_bg_color(btn_home, lv_color_make(28, 28, 34), 0);
-    lv_obj_set_style_shadow_width(btn_home, 0, 0);
-    lv_obj_add_event_cb(btn_home, btn_home_click_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *lbl_home = lv_label_create(btn_home);
-    lv_obj_set_style_text_font(lbl_home, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(lbl_home, lv_palette_main(LV_PALETTE_AMBER), 0);
-    lv_label_set_text(lbl_home, LV_SYMBOL_HOME);
-    lv_obj_center(lbl_home);
+    /* ===== 3. 曲目信息区（居中） ===== */
+    s_lbl_title = ui_label_create(s_page, "加州旅馆 - Eagles (Live)", UI_FONT_CJK_M, UI_COL_TEXT);
+    label_ellipsis(s_lbl_title, UI_SCR_W - UI_PAD_X * 2 - 20);
+    lv_obj_set_style_text_align(s_lbl_title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_lbl_title, LV_ALIGN_TOP_MID, 0, 252);
+
+    /* 副行：艺术家 · 采样率/位深 */
+    lv_obj_t *sub_row = make_transparent(s_page, 0, 0, UI_SCR_W - UI_PAD_X * 2 - 20, 22);
+    lv_obj_set_flex_flow(sub_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(sub_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(sub_row, 6, 0);
+    lv_obj_align_to(sub_row, s_lbl_title, LV_ALIGN_OUT_BOTTOM_MID, 0, 6);
+
+    s_lbl_artist = ui_label_create(sub_row, "Eagles", UI_FONT_CJK_S, UI_COL_TEXT2);
+    lv_obj_set_width(s_lbl_artist, LV_SIZE_CONTENT);
+    lv_label_set_long_mode(s_lbl_artist, LV_LABEL_LONG_DOT);
+
+    lv_obj_t *dot = lv_obj_create(sub_row);
+    lv_obj_remove_style_all(dot);
+    lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(dot, 4, 4);
+    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(dot, UI_COL_TEXT2, 0);
+    lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(dot, 0, 0);
+
+    s_lbl_rate = ui_label_create(sub_row, "96kHz / 24bit", UI_FONT_CJK_S, UI_COL_TEXT2);
+    lv_obj_set_width(s_lbl_rate, LV_SIZE_CONTENT);
+    lv_label_set_long_mode(s_lbl_rate, LV_LABEL_LONG_DOT);
+
+    /* ===== 4. 进度区 ===== */
+    lv_obj_t *prog = ui_progress_create(s_page, 6, 314,
+                                        UI_SCR_W - UI_PAD_X * 2 - 12,
+                                        &s_prog_fill, &s_prog_knob);
+    lv_obj_add_flag(prog, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(prog, progress_tap_cb, LV_EVENT_CLICKED, NULL);
+
+    s_lbl_time_cur = ui_label_create(s_page, "01:45", UI_FONT_TINY, UI_COL_TEXT2);
+    label_ellipsis(s_lbl_time_cur, 80);
+    lv_obj_align(s_lbl_time_cur, LV_ALIGN_TOP_LEFT, 6, 324);
+
+    s_lbl_time_tot = ui_label_create(s_page, "06:30", UI_FONT_TINY, UI_COL_TEXT2);
+    label_ellipsis(s_lbl_time_tot, 80);
+    lv_obj_set_style_text_align(s_lbl_time_tot, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_align(s_lbl_time_tot, LV_ALIGN_TOP_RIGHT, -6, 324);
+
+    /* ===== 5. 5 键控制区：[随机] [上一曲] [播放/暂停] [下一曲] [循环] ===== */
+    lv_obj_t *ctrl = make_transparent(s_page, 0, 354, UI_SCR_W - UI_PAD_X * 2, 72);
+    lv_obj_set_flex_flow(ctrl, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(ctrl, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    /* 1. 随机播放键 (42px) */
+    s_btn_shuffle = ui_round_button_create(ctrl, 0, 0, 42, &ui_icon_shuffle, UI_COL_TEXT3,
+                                           UI_COL_PILL, shuffle_click_cb, &s_img_shuffle);
+
+    /* 2. 上一曲 (52px) */
+    ui_round_button_create(ctrl, 0, 0, 52, &ui_icon_prev, UI_COL_TEXT,
+                           UI_COL_PILL, prev_cb, NULL);
+
+    /* 3. 主按键：播放/暂停 (70px，金橙高亮底) */
+    s_btn_play = ui_round_button_create(ctrl, 0, 0, 70, &ui_icon_pause, UI_COL_BG,
+                                        UI_COL_ACCENT, btn_play_click_cb, &s_play_icon);
+    (void)s_btn_play;
+
+    /* 4. 下一曲 (52px) */
+    ui_round_button_create(ctrl, 0, 0, 52, &ui_icon_next, UI_COL_TEXT,
+                           UI_COL_PILL, next_cb, NULL);
+
+    /* 5. 循环播放键 (42px) */
+    s_btn_repeat = ui_round_button_create(ctrl, 0, 0, 42, &ui_icon_repeat, UI_COL_ACCENT,
+                                          UI_COL_ACCENT_SOFT, repeat_click_cb, &s_img_repeat);
+
+    update_mode_buttons();
+
+    /* ===== 6. 居中浮动 HUD 胶囊（用于音量手势与模式切换） ===== */
+    s_hud = lv_obj_create(s_page);
+    lv_obj_remove_style_all(s_hud);
+    lv_obj_clear_flag(s_hud, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(s_hud, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_size(s_hud, 140, 116);
+    lv_obj_set_style_radius(s_hud, 24, 0);
+    lv_obj_set_style_bg_color(s_hud, UI_COL_CARD_BOT, 0);
+    lv_obj_set_style_bg_opa(s_hud, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_hud, 1, 0);
+    lv_obj_set_style_border_color(s_hud, UI_COL_ACCENT_LINE, 0);
+    lv_obj_set_style_pad_all(s_hud, 14, 0);
+    lv_obj_set_style_pad_row(s_hud, 6, 0);
+    lv_obj_set_flex_flow(s_hud, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_hud, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_align(s_hud, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_add_flag(s_hud, LV_OBJ_FLAG_HIDDEN);
+
+    s_hud_icon = ui_icon_create(s_hud, 0, 0, &ui_icon_volume, UI_COL_ACCENT);
+    s_lbl_hud  = ui_label_create(s_hud, "80%", UI_FONT_CJK_S, UI_COL_TEXT);
+    label_ellipsis(s_lbl_hud, 120);
+    lv_obj_set_style_text_align(s_lbl_hud, LV_TEXT_ALIGN_CENTER, 0);
+
+    /* ===== 7. 手势与底部手势条 ===== */
+    lv_obj_add_event_cb(s_page, player_gesture_cb, LV_EVENT_GESTURE, NULL);
+    lv_obj_add_event_cb(s_screen, player_gesture_cb, LV_EVENT_GESTURE, NULL);
+    ui_gesture_hint_create(s_screen);
 
     return s_screen;
 }
 
+/* ---------------------------------------------------------------
+ * 周期刷新（ui_manager 每 200ms 调用一次）
+ * --------------------------------------------------------------- */
 void ui_view_player_update(void)
 {
     if (!s_screen) return;
@@ -301,72 +530,105 @@ void ui_view_player_update(void)
     player_status_t st;
     player_get_status(&st);
 
-    /* 1. 更新播放状态与图标 */
-    if (st.state == PLAYER_STATE_PLAYING) {
-        lv_label_set_text(s_lbl_play_icon, LV_SYMBOL_PAUSE);
-    } else {
-        lv_label_set_text(s_lbl_play_icon, LV_SYMBOL_PLAY);
+    /* 1. 播放状态 → 主键图标 */
+    if (s_play_icon) {
+        lv_img_set_src(s_play_icon,
+                       (st.state == PLAYER_STATE_PLAYING) ? &ui_icon_pause : &ui_icon_play);
+        lv_obj_center(s_play_icon);
     }
 
-    /* 2. 更新曲目名与格式 */
-    if (st.state != PLAYER_STATE_STOPPED && st.current_path[0]) {
-        /* 从路径提取文件名 */
-        const char *fname = strrchr(st.current_path, '/');
-        fname = fname ? (fname + 1) : st.current_path;
-        lv_label_set_text(s_lbl_title, fname);
+    bool has_track = (st.state != PLAYER_STATE_STOPPED &&
+                      st.state != PLAYER_STATE_ERROR && st.current_path[0]);
 
-        /* 格式徽标 */
-        char badge_buf[64];
-        const char *typeName = "PCM";
-        switch (st.track_info.type) {
-            case DECODER_TYPE_FLAC: typeName = "FLAC"; break;
-            case DECODER_TYPE_WAV:  typeName = "WAV"; break;
-            case DECODER_TYPE_MP3:  typeName = "MP3"; break;
-            case DECODER_TYPE_DSD_DSF: typeName = "DSD64 (DoP)"; break;
-            case DECODER_TYPE_AAC_M4A: typeName = "AAC"; break;
-            default: break;
+    /* 2. 格式徽标 / 曲名 / 副行 */
+    if (has_track) {
+        char khz[24];
+        fmt_khz(khz, sizeof(khz), st.track_info.fmt.sample_rate);
+
+        if (s_lbl_badge) {
+            char badge[48];
+            snprintf(badge, sizeof(badge), "%s %s %dbit",
+                     decoder_type_name(st.track_info.type), khz,
+                     (int)st.track_info.fmt.bits_per_sample);
+            lv_label_set_text(s_lbl_badge, badge);
         }
-        snprintf(badge_buf, sizeof(badge_buf), "%s | %lu Hz | %d bit",
-                 typeName, (unsigned long)st.track_info.fmt.sample_rate,
-                 st.track_info.fmt.bits_per_sample);
-        lv_label_set_text(s_lbl_badge, badge_buf);
+
+        char title[256];
+        track_title(title, sizeof(title), &st);
+        if (s_lbl_title) {
+            lv_label_set_text(s_lbl_title, title[0] ? title : "未知曲目");
+        }
+
+        char artist[128];
+        track_artist(artist, sizeof(artist), &st);
+        if (s_lbl_artist) {
+            lv_label_set_text(s_lbl_artist, artist[0] ? artist : "Eagles");
+        }
+        if (s_lbl_rate) {
+            char rate[64];
+            snprintf(rate, sizeof(rate), "%s / %dbit", khz,
+                     (int)st.track_info.fmt.bits_per_sample);
+            lv_label_set_text(s_lbl_rate, rate);
+        }
+
+        /* 同步更新卡片中央文字（无封面模式下的专辑信息） */
+        if (s_card_artist) {
+            lv_label_set_text(s_card_artist, artist[0] ? artist : "EAGLES");
+        }
+        if (s_card_album) {
+            lv_label_set_text(s_card_album, title[0] ? title : "Hotel California");
+        }
+    } else {
+        if (s_lbl_badge) lv_label_set_text(s_lbl_badge, "无播放");
+        if (s_lbl_title) lv_label_set_text(s_lbl_title, "未在播放");
+        if (s_lbl_artist) lv_label_set_text(s_lbl_artist, "FAKE POD NANO");
+        if (s_lbl_rate)   lv_label_set_text(s_lbl_rate, "Hi-Fi Player");
     }
 
-    /* 3. 更新进度条与时间。拖动期间不回写，否则手指会被播放进度拽回去。 */
-    if (!s_slider_dragging) {
-        lv_slider_set_range(s_slider_progress, 0, st.total_time_sec ? st.total_time_sec : 100);
-        lv_slider_set_value(s_slider_progress, st.current_time_sec, LV_ANIM_OFF);
+    /* 3. 进度条 + 已播/总时长 */
+    uint32_t total = st.total_time_sec;
+    uint32_t cur   = st.current_time_sec;
+    int pct = total ? (int)((uint64_t)cur * 100u / total) : 0;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    if (pct != s_last_pct) {
+        ui_progress_set_percent(s_prog_fill, s_prog_knob, pct);
+        s_last_pct = pct;
     }
 
-    char time_str[16];
-    snprintf(time_str, sizeof(time_str), "%02lu:%02lu",
-             (unsigned long)(st.current_time_sec / 60),
-             (unsigned long)(st.current_time_sec % 60));
-    lv_label_set_text(s_lbl_time_cur, time_str);
+    char tbuf[16];
+    snprintf(tbuf, sizeof(tbuf), "%02lu:%02lu",
+             (unsigned long)(cur / 60u), (unsigned long)(cur % 60u));
+    if (s_lbl_time_cur) lv_label_set_text(s_lbl_time_cur, tbuf);
 
-    snprintf(time_str, sizeof(time_str), "%02lu:%02lu",
-             (unsigned long)(st.total_time_sec / 60),
-             (unsigned long)(st.total_time_sec % 60));
-    lv_label_set_text(s_lbl_time_tot, time_str);
+    snprintf(tbuf, sizeof(tbuf), "%02lu:%02lu",
+             (unsigned long)(total / 60u), (unsigned long)(total % 60u));
+    if (s_lbl_time_tot) lv_label_set_text(s_lbl_time_tot, tbuf);
 
-    /* 4. 专辑封面：曲目变化时尝试解析内嵌封面，失败则回退黑胶唱盘 */
-    if (st.state != PLAYER_STATE_STOPPED && st.current_path[0]) {
+    /* 4. 专辑封面检测（有内嵌图则覆盖卡片） */
+    if (has_track) {
         if (strcmp(st.current_path, s_cover_path) != 0) {
             snprintf(s_cover_path, sizeof(s_cover_path), "%s", st.current_path);
             lv_img_dsc_t dsc;
             if (album_art_get(st.current_path, &dsc)) {
                 s_cover_dsc = dsc;
-                lv_img_set_src(s_img_cover, &s_cover_dsc);
-                lv_obj_clear_flag(s_img_cover, LV_OBJ_FLAG_HIDDEN);
-                if (s_disc) lv_obj_add_flag(s_disc, LV_OBJ_FLAG_HIDDEN);
+                if (s_img_cover) {
+                    lv_img_set_src(s_img_cover, &s_cover_dsc);
+                    lv_obj_center(s_img_cover);
+                    lv_obj_clear_flag(s_img_cover, LV_OBJ_FLAG_HIDDEN);
+                }
             } else {
-                lv_obj_add_flag(s_img_cover, LV_OBJ_FLAG_HIDDEN);
-                if (s_disc) lv_obj_clear_flag(s_disc, LV_OBJ_FLAG_HIDDEN);
+                if (s_img_cover) {
+                    lv_img_set_src(s_img_cover, NULL);
+                    lv_obj_add_flag(s_img_cover, LV_OBJ_FLAG_HIDDEN);
+                }
             }
         }
     } else {
-        lv_obj_add_flag(s_img_cover, LV_OBJ_FLAG_HIDDEN);
-        if (s_disc) lv_obj_clear_flag(s_disc, LV_OBJ_FLAG_HIDDEN);
-        s_cover_path[0] = 0;
+        if (s_img_cover) {
+            lv_img_set_src(s_img_cover, NULL);
+            lv_obj_add_flag(s_img_cover, LV_OBJ_FLAG_HIDDEN);
+        }
+        s_cover_path[0] = '\0';
     }
 }

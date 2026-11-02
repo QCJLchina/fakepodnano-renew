@@ -1,73 +1,214 @@
 /**
- * FAKE_POD_NANO 系统设置页实现
+ * FAKE_POD_NANO 系统设置页 / 关于本设备页实现
+ * ================================================
+ * 视觉基准：prototype/index.html 的 `.settings-list / .setting-card / .setting-header /
+ *           .setting-title / .setting-val / .setting-pills-row / .setting-option-btn`
+ *           → design_ref/settings.png、design_ref/about.png（460x460 设计截图，2x）。
+ *
+ * 版式（页面内边距 18/14，子对象坐标从页面内容区起算，内容宽 424）：
+ *   导航头   屏幕 y=14，高 36：左「桌面」药丸（home 图标 + 文案）+ 标题「系统设置」
+ *   滚动列   屏幕 y=58 起，424x388，行间距 12
+ *   设置卡片 424 宽、圆角 18、#18191D 底、1px 描边，内边距 16/14：
+ *              卡片头（左标题白 / 右当前值强调色）+ 档位药丸行（高 32、圆角 10）
+ *   手势条   底部居中（ui_gesture_hint_create）
+ *
+ * 行为保持与旧实现一致：
+ *   - 屏幕亮度 6 档（10/30/50/70/90/100）真实调用 ui_set_backlight_pct()
+ *   - 自动息屏 4 档（30秒/1分钟/3分钟/常亮）真实调用 ui_set_auto_off_sec()
+ *   - 均衡器 5 预设（关闭/流行/摇滚/古典/人声）走 audio_pipeline_set_eq()
+ *   - IMU 手势开关走 imu_service_set_enabled()（未检测到芯片时只显示，不可切换）
+ *   - 防爆耳音量上限固定 85%（仅展示，旧实现即无对应设置接口）
+ *   - 系统时钟同步：一键对时沿用 ble_time_sync 入口（BLE 服务本来开机即启动）
+ *   - 关于本设备：独立 screen，导出 ui_view_settings_about_create/update()
  */
 
 #include "ui_view_settings.h"
 #include "ui_manager.h"
-#include "ui_fonts.h"
+#include "ui_theme.h"
 #include "audio_pipeline.h"
 #include "imu_service.h"
-#include "dac_cs43131.h"
+#include "ble_time_sync.h"
 #include "esp_log.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 
 #include <stdio.h>
+#include <stdint.h>
 
-#define ACCENT          lv_palette_main(LV_PALETTE_AMBER)
-#define CARD_BG         lv_color_make(20, 20, 26)
-#define CARD_BORDER     lv_color_make(44, 44, 54)
-#define TEXT_DIM        lv_color_make(150, 150, 165)
+/* ---------------------------------------------------------------
+ * 版式常量（页面内容区坐标）
+ * --------------------------------------------------------------- */
+#define CARD_W          424
+#define CARD_RADIUS     18
+#define CARD_PAD_X      16
+#define CARD_PAD_Y      14
+#define PILL_H          32
+#define HEAD_Y          14
+#define PILL_Y          (HEAD_Y + 30)   /* 44：卡片头(20) + 间距(10) */
+#define COL_X           0               /* 页面内容区左边 = 屏幕 18 */
+#define COL_Y           44              /* 屏幕 58 */
+#define COL_W           424
+#define COL_H           388
+#define COL_GAP         12
+
+static const int  kBrightPct[6]   = { 10, 30, 50, 70, 90, 100 };
+static const int  kAutoOffSec[4]  = { 30, 60, 180, 0 };
+static const char *kAutoOffText[4] = { "30秒", "1分钟", "3分钟", "常亮" };
+static const char *kEqName[5]     = { "关闭", "流行", "摇滚", "古典", "人声" };
 
 static lv_obj_t *s_screen = NULL;
-static lv_obj_t *s_about = NULL;
-static lv_obj_t *s_eq = NULL;
+static lv_obj_t *s_about  = NULL;
+
+static lv_obj_t *s_val_bright = NULL;
+static lv_obj_t *s_val_eq     = NULL;
+static lv_obj_t *s_val_auto   = NULL;
+static lv_obj_t *s_val_imu    = NULL;
+
 static lv_obj_t *s_btn_bright[6];
 static lv_obj_t *s_btn_auto[4];
 static lv_obj_t *s_btn_eq[5];
-static lv_obj_t *s_btn_imu = NULL;
-
-static const char *kEqName[5] = { "关闭", "流行", "摇滚", "古典", "人声" };
-
-static const int kBrightPct[6] = { 10, 30, 50, 70, 90, 100 };
-static const int kAutoOffSec[4] = { 30, 60, 180, 0 };
-static const char *kAutoOffText[4] = { "30秒", "1分钟", "3分钟", "从不" };
+static lv_obj_t *s_btn_imu[2];
 
 /* ---------------------------------------------------------------
- * 选中态风格
+ * 基础小工具
  * --------------------------------------------------------------- */
-static void style_toggle(lv_obj_t *btn, bool selected)
+static lv_obj_t* card_begin(lv_obj_t *col, int h)
 {
-    lv_obj_set_style_border_width(btn, selected ? 2 : 1, 0);
-    lv_obj_set_style_border_color(btn, selected ? ACCENT : CARD_BORDER, 0);
-    lv_obj_set_style_bg_color(btn, selected ? lv_color_make(38, 32, 22) : CARD_BG, 0);
+    return ui_surface_create(col, 0, 0, CARD_W, h, CARD_RADIUS);
 }
 
-static void refresh_bright_styles(void)
+/** 卡片头：左标题（白）+ 右当前值（强调色），返回当前值 label 供刷新 */
+static lv_obj_t* card_header(lv_obj_t *card, const char *title)
+{
+    lv_obj_t *t = ui_label_create(card, title, UI_FONT_CJK_S, UI_COL_TEXT);
+    lv_obj_set_width(t, 250);
+    lv_label_set_long_mode(t, LV_LABEL_LONG_DOT);
+    lv_obj_set_pos(t, CARD_PAD_X, HEAD_Y);
+
+    lv_obj_t *v = ui_label_create(card, "", UI_FONT_CJK_S, UI_COL_ACCENT);
+    lv_obj_set_width(v, 150);
+    lv_label_set_long_mode(v, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(v, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_align(v, LV_ALIGN_TOP_RIGHT, -CARD_PAD_X, HEAD_Y);
+    return v;
+}
+
+/** 一行说明文字（次级灰，单行省略） */
+static lv_obj_t* note_line(lv_obj_t *card, const char *txt, int y)
+{
+    lv_obj_t *l = ui_label_create(card, txt, UI_FONT_CJK_S, UI_COL_TEXT2);
+    lv_obj_set_width(l, CARD_W - CARD_PAD_X * 2);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+    lv_obj_set_pos(l, CARD_PAD_X, y);
+    return l;
+}
+
+/** 档位药丸行：n 个等宽药丸，gap 6（6 档）/ 8（其余），注册带索引的回调 */
+static void build_pill_row(lv_obj_t *card, const char *const *names, int n,
+                           lv_event_cb_t cb, lv_obj_t **out)
+{
+    const int gap = (n == 6) ? 6 : 8;
+    const int w = (CARD_W - CARD_PAD_X * 2 - (n - 1) * gap) / n;
+    for (int i = 0; i < n; i++) {
+        lv_obj_t *p = ui_option_pill_create(card, CARD_PAD_X + i * (w + gap), PILL_Y,
+                                            w, PILL_H, names[i], false, NULL);
+        lv_obj_add_event_cb(p, cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        out[i] = p;
+    }
+}
+
+/** 档位选中态：先走皮肤 helper，再补 bg_opa。
+ *  ui_option_pill_create 内部 strip_obj() 会清掉主题默认样式，导致 bg_opa = 0；
+ *  只设 bg_color 时高亮档位会变成纯黑（黑字看不见）。这里统一补不透明度。 */
+static void pill_set(lv_obj_t *p, bool on)
+{
+    if (!p) return;
+    ui_option_pill_set_active(p, on);
+    lv_obj_set_style_bg_opa(p, LV_OPA_COVER, 0);
+}
+
+/** 1px 分隔线（用设计令牌，不手写颜色） */
+static void hairline(lv_obj_t *parent, int x, int y, int w)
+{
+    lv_obj_t *l = lv_obj_create(parent);
+    lv_obj_remove_style_all(l);
+    lv_obj_set_size(l, w, 1);
+    lv_obj_set_pos(l, x, y);
+    lv_obj_set_style_bg_color(l, UI_COL_SURFACE_LINE, 0);
+    lv_obj_set_style_bg_opa(l, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(l, 0, 0);
+    lv_obj_clear_flag(l, LV_OBJ_FLAG_SCROLLABLE);
+}
+
+/* ---------------------------------------------------------------
+ * 刷新选中态 / 当前值
+ * --------------------------------------------------------------- */
+static void refresh_bright(void)
 {
     int cur = ui_get_backlight_pct();
     for (int i = 0; i < 6; i++) {
-        if (s_btn_bright[i]) style_toggle(s_btn_bright[i], kBrightPct[i] == cur);
+        if (s_btn_bright[i]) pill_set(s_btn_bright[i], kBrightPct[i] == cur);
+    }
+    if (s_val_bright) {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%d%%", cur);
+        lv_label_set_text(s_val_bright, buf);
     }
 }
 
-static void refresh_auto_styles(void)
+static void refresh_auto(void)
 {
     int cur = ui_get_auto_off_sec();
+    int hit = -1;
     for (int i = 0; i < 4; i++) {
-        if (s_btn_auto[i]) style_toggle(s_btn_auto[i], kAutoOffSec[i] == cur);
+        bool on = (kAutoOffSec[i] == cur);
+        if (on) hit = i;
+        if (s_btn_auto[i]) pill_set(s_btn_auto[i], on);
     }
+    if (s_val_auto) {
+        if (hit >= 0) {
+            lv_label_set_text(s_val_auto, kAutoOffText[hit]);
+        } else {
+            char buf[16];
+            snprintf(buf, sizeof(buf), "常亮");
+            lv_label_set_text(s_val_auto, buf);
+        }
+    }
+}
+
+static void refresh_eq(void)
+{
+    int cur = audio_pipeline_get_eq();
+    for (int i = 0; i < 5; i++) {
+        if (s_btn_eq[i]) pill_set(s_btn_eq[i], i == cur);
+    }
+    if (s_val_eq) {
+        lv_label_set_text(s_val_eq, (cur >= 0 && cur < 5) ? kEqName[cur] : "关闭");
+    }
+}
+
+static void refresh_imu(void)
+{
+    bool present = imu_service_present();
+    bool on = present && imu_service_get_enabled();
+    if (s_btn_imu[0]) pill_set(s_btn_imu[0], on);
+    if (s_btn_imu[1]) pill_set(s_btn_imu[1], present && !on);
+    if (s_val_imu) lv_label_set_text(s_val_imu, present ? (on ? "开" : "关") : "未检测");
 }
 
 /* ---------------------------------------------------------------
  * 事件
  * --------------------------------------------------------------- */
+static void back_home_cb(lv_event_t *e)
+{
+    (void)e;
+    ui_switch_view(UI_VIEW_HOME);
+}
+
 static void bright_click_cb(lv_event_t *e)
 {
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
     if (idx < 0 || idx > 5) return;
     ui_set_backlight_pct(kBrightPct[idx]);
-    refresh_bright_styles();
+    refresh_bright();
 }
 
 static void auto_click_cb(lv_event_t *e)
@@ -75,63 +216,18 @@ static void auto_click_cb(lv_event_t *e)
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
     if (idx < 0 || idx > 3) return;
     ui_set_auto_off_sec(kAutoOffSec[idx]);
-    refresh_auto_styles();
+    refresh_auto();
 }
 
-static void home_click_cb(lv_event_t *e)
-{
-    (void)e;
-    ui_switch_view(UI_VIEW_HOME);
-}
-
-static void about_open_cb(lv_event_t *e)
-{
-    (void)e;
-    if (s_about) lv_obj_clear_flag(s_about, LV_OBJ_FLAG_HIDDEN);
-}
-
-static void about_close_cb(lv_event_t *e)
-{
-    (void)e;
-    if (s_about) lv_obj_add_flag(s_about, LV_OBJ_FLAG_HIDDEN);
-}
-
-/* ---------------------------------------------------------------
- * 均衡器
- * --------------------------------------------------------------- */
-static void eq_refresh_styles(void)
-{
-    int cur = audio_pipeline_get_eq();
-    for (int i = 0; i < 5; i++) {
-        if (s_btn_eq[i]) style_toggle(s_btn_eq[i], i == cur);
-    }
-}
-
-static void eq_open_cb(lv_event_t *e)
-{
-    (void)e;
-    if (s_eq) {
-        eq_refresh_styles();
-        lv_obj_clear_flag(s_eq, LV_OBJ_FLAG_HIDDEN);
-    }
-}
-
-static void eq_close_cb(lv_event_t *e)
-{
-    (void)e;
-    if (s_eq) lv_obj_add_flag(s_eq, LV_OBJ_FLAG_HIDDEN);
-}
-
-static void eq_pick_cb(lv_event_t *e)
+static void eq_click_cb(lv_event_t *e)
 {
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
     if (idx < 0 || idx > 4) return;
     audio_pipeline_set_eq(idx);
-    eq_refresh_styles();
+    refresh_eq();
 }
 
-/* 测试音：验证 DAC/耳放是否出声（不经过 USB）。
- * 内部会按 44.1k/16bit 初始化 DAC，并依次试播 5 个音质档。 */
+/** 测试音：验证 DAC/耳放通路（不经过 USB），沿用旧的 audio_pipeline 接口 */
 static void tone_click_cb(lv_event_t *e)
 {
     (void)e;
@@ -141,283 +237,237 @@ static void tone_click_cb(lv_event_t *e)
     }
 }
 
-/* ---------------------------------------------------------------
- * IMU 手势开关
- * --------------------------------------------------------------- */
-static void imu_refresh_label(void)
+static void imu_click_cb(lv_event_t *e)
 {
-    if (!s_btn_imu) return;
-    lv_obj_t *lbl = lv_obj_get_child(s_btn_imu, 0);
-    if (!lbl) return;
-    if (!imu_service_present()) {
-        lv_label_set_text(lbl, "IMU 未检测");
-    } else {
-        lv_label_set_text(lbl, imu_service_get_enabled() ? "IMU 手势 开" : "IMU 手势 关");
-    }
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (!imu_service_present()) return;
+    imu_service_set_enabled(idx == 0);
+    refresh_imu();
 }
 
-static void imu_toggle_cb(lv_event_t *e)
+/** 一键对时：沿用 ble_time_sync 入口（服务开机已启动，这里再次广播校时） */
+static void sync_click_cb(lv_event_t *e)
 {
     (void)e;
-    if (!imu_service_present()) return;
-    imu_service_set_enabled(!imu_service_get_enabled());
-    imu_refresh_label();
+#if defined(ESP_PLATFORM)
+    esp_err_t err = ble_time_sync_start();
+    if (err != ESP_OK) {
+        ESP_LOGW("SETTINGS", "BLE 对时启动失败: %s", esp_err_to_name(err));
+    }
+#endif
+}
+
+static void about_open_cb(lv_event_t *e)
+{
+    (void)e;
+    lv_obj_t *about = ui_view_settings_about_create();
+    if (about) lv_scr_load(about);
 }
 
 /* ---------------------------------------------------------------
- * 创建按钮小工具
+ * 关于本设备（独立 screen）
  * --------------------------------------------------------------- */
-static lv_obj_t* make_btn(lv_obj_t *parent, const char *text, int w, int h,
-                          lv_event_cb_t cb, int user_idx)
+static void about_back_cb(lv_event_t *e)
 {
-    lv_obj_t *btn = lv_btn_create(parent);
-    lv_obj_set_size(btn, w, h);
-    lv_obj_set_style_radius(btn, 12, 0);
-    lv_obj_set_style_bg_color(btn, CARD_BG, 0);
-    lv_obj_set_style_border_width(btn, 1, 0);
-    lv_obj_set_style_border_color(btn, CARD_BORDER, 0);
-    lv_obj_set_style_shadow_width(btn, 0, 0);
-    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, (void *)(intptr_t)user_idx);
-
-    lv_obj_t *lbl = lv_label_create(btn);
-    lv_obj_set_style_text_font(lbl, &ui_font_cjk_16, 0);
-    lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
-    lv_label_set_text(lbl, text);
-    lv_obj_center(lbl);
-    return btn;
+    (void)e;
+    if (s_screen) lv_scr_load(s_screen);
 }
 
-static lv_obj_t* make_section_label(lv_obj_t *parent, const char *text, int y)
+static void build_about_page(lv_obj_t *screen)
 {
-    lv_obj_t *lbl = lv_label_create(parent);
-    lv_obj_set_style_text_font(lbl, &ui_font_cjk_16, 0);
-    lv_obj_set_style_text_color(lbl, TEXT_DIM, 0);
-    lv_label_set_text(lbl, text);
-    lv_obj_align(lbl, LV_ALIGN_TOP_LEFT, 16, y);
-    return lbl;
-}
+    lv_obj_t *page = ui_page_create(screen);
+    ui_nav_header_create(page, 14, "设置", "关于本设备", about_back_cb, NULL);
 
-/* ---------------------------------------------------------------
- * 关于本设备（覆盖层）
- * --------------------------------------------------------------- */
-static void build_about(lv_obj_t *parent)
-{
-    s_about = lv_obj_create(parent);
-    lv_obj_set_size(s_about, 460, 460);
-    lv_obj_set_pos(s_about, 0, 0);
-    lv_obj_set_style_bg_color(s_about, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(s_about, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(s_about, 0, 0);
-    lv_obj_set_style_pad_all(s_about, 16, 0);
+    lv_obj_t *col = ui_scroll_column_create(page, COL_X, COL_Y, COL_W, COL_H, COL_GAP);
 
-    lv_obj_t *btn_back = lv_btn_create(s_about);
-    lv_obj_set_size(btn_back, 60, 40);
-    lv_obj_align(btn_back, LV_ALIGN_TOP_LEFT, 0, 0);
-    lv_obj_set_style_radius(btn_back, 10, 0);
-    lv_obj_set_style_bg_color(btn_back, lv_color_make(28, 28, 34), 0);
-    lv_obj_set_style_shadow_width(btn_back, 0, 0);
-    lv_obj_add_event_cb(btn_back, about_close_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *lbl_b = lv_label_create(btn_back);
-    lv_obj_set_style_text_font(lbl_b, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(lbl_b, ACCENT, 0);
-    lv_label_set_text(lbl_b, LV_SYMBOL_LEFT);
-    lv_obj_center(lbl_b);
+    /* 铭牌区：渐变底 + 强调色描边，大标题 + 软件设计 */
+    lv_obj_t *name = ui_surface_create(col, 0, 0, CARD_W, 96, CARD_RADIUS);
+    lv_obj_set_style_bg_color(name, UI_COL_CARD_TOP, 0);
+    lv_obj_set_style_bg_grad_color(name, UI_COL_CARD_BOT, 0);
+    lv_obj_set_style_bg_grad_dir(name, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_border_color(name, UI_COL_ACCENT_LINE, 0);
 
-    lv_obj_t *title = lv_label_create(s_about);
-    lv_obj_set_style_text_font(title, &ui_font_cjk_20, 0);
-    lv_obj_set_style_text_color(title, lv_color_white(), 0);
-    lv_label_set_text(title, "关于本设备");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
+    lv_obj_t *title = ui_label_create(name, "FAKE POD NANO", UI_FONT_LG, UI_COL_TEXT);
+    lv_obj_set_width(title, CARD_W - 32);
+    lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 18);
 
-    lv_obj_t *info = lv_label_create(s_about);
-    lv_obj_set_style_text_font(info, &ui_font_cjk_16, 0);
-    lv_obj_set_style_text_color(info, lv_color_make(200, 200, 210), 0);
-    lv_obj_set_style_text_line_space(info, 8, 0);
-    lv_label_set_text(info,
-        "型号：FAKE POD NANO\n"
-        "设计：QCJL\n"
-        "\n"
-        "主控：ESP32-S3 双核 240MHz\n"
-        "存储：16MB Flash / 8MB PSRAM\n"
-        "解码：Cirrus Logic CS43131\n"
-        "屏幕：2.0 英寸 AMOLED 460x460\n"
-        "硬件上限：384kHz / 32bit & DSD256\n"
-        "USB 声卡：最高 96kHz / 24bit");
-    lv_obj_align(info, LV_ALIGN_TOP_LEFT, 10, 70);
+    lv_obj_t *design = ui_label_create(name, "软件设计：QCJL", UI_FONT_CJK_S, UI_COL_ACCENT);
+    lv_obj_set_width(design, CARD_W - 32);
+    lv_label_set_long_mode(design, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(design, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(design, LV_ALIGN_TOP_MID, 0, 56);
 
-    lv_obj_add_flag(s_about, LV_OBJ_FLAG_HIDDEN);
-}
+    /* 状态信息卡片 */
+    lv_obj_t *info = ui_surface_create(col, 0, 0, CARD_W, 236, CARD_RADIUS);
+    lv_obj_t *head = ui_label_create(info, "状态信息", UI_FONT_CJK_S, UI_COL_ACCENT);
+    lv_obj_set_width(head, 200);
+    lv_label_set_long_mode(head, LV_LABEL_LONG_DOT);
+    lv_obj_set_pos(head, CARD_PAD_X, 12);
 
-/* ---------------------------------------------------------------
- * 均衡器覆盖层
- * --------------------------------------------------------------- */
-static void build_eq(lv_obj_t *parent)
-{
-    s_eq = lv_obj_create(parent);
-    lv_obj_set_size(s_eq, 460, 460);
-    lv_obj_set_pos(s_eq, 0, 0);
-    lv_obj_set_style_bg_color(s_eq, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(s_eq, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(s_eq, 0, 0);
-    lv_obj_set_style_pad_all(s_eq, 16, 0);
+    static const char *rows_l[5] = {
+        "主控芯片", "存储规格", "解码芯片", "显示面板", "硬件最高规格"
+    };
+    static const char *rows_v[5] = {
+        "ESP32-S3 Dual-Core 240MHz",
+        "16MB Flash / 8MB Octal PSRAM",
+        "Cirrus Logic CS43131 MasterHIFI",
+        "2.0\" AMOLED 460x460 (CO5300)",
+        "384.0 kHz / 32-bit & DSD256",
+    };
 
-    lv_obj_t *btn_back = lv_btn_create(s_eq);
-    lv_obj_set_size(btn_back, 60, 40);
-    lv_obj_align(btn_back, LV_ALIGN_TOP_LEFT, 0, 0);
-    lv_obj_set_style_radius(btn_back, 10, 0);
-    lv_obj_set_style_bg_color(btn_back, lv_color_make(28, 28, 34), 0);
-    lv_obj_set_style_shadow_width(btn_back, 0, 0);
-    lv_obj_add_event_cb(btn_back, eq_close_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *lb = lv_label_create(btn_back);
-    lv_obj_set_style_text_font(lb, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(lb, ACCENT, 0);
-    lv_label_set_text(lb, LV_SYMBOL_LEFT);
-    lv_obj_center(lb);
-
-    lv_obj_t *title = lv_label_create(s_eq);
-    lv_obj_set_style_text_font(title, &ui_font_cjk_20, 0);
-    lv_obj_set_style_text_color(title, lv_color_white(), 0);
-    lv_label_set_text(title, "均衡器");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 12);
-
+    const int y0 = 42;
+    const int rh = 36;
     for (int i = 0; i < 5; i++) {
-        s_btn_eq[i] = make_btn(s_eq, kEqName[i], 260, 54, eq_pick_cb, i);
-        lv_obj_align(s_btn_eq[i], LV_ALIGN_TOP_MID, 0, 62 + i * 62);
+        if (i > 0) hairline(info, CARD_PAD_X, y0 + i * rh - 1, CARD_W - CARD_PAD_X * 2);
+
+        lv_obj_t *lab = ui_label_create(info, rows_l[i], UI_FONT_CJK_S, UI_COL_TEXT2);
+        lv_obj_set_width(lab, 110);
+        lv_label_set_long_mode(lab, LV_LABEL_LONG_DOT);
+        lv_obj_set_pos(lab, 20, y0 + i * rh + 8);
+
+        lv_color_t vc = (i == 4) ? UI_COL_ACCENT : UI_COL_TEXT;
+        lv_obj_t *val = ui_label_create(info, rows_v[i], UI_FONT_SM, vc);
+        lv_obj_set_width(val, 272);
+        lv_label_set_long_mode(val, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_align(val, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_obj_align(val, LV_ALIGN_TOP_RIGHT, -20, y0 + i * rh + 9);
     }
 
-    /* 测试音：验证 DAC/耳放通路（内部依次试播 5 个音质档） */
-    lv_obj_t *btn_tone = lv_btn_create(s_eq);
-    lv_obj_set_size(btn_tone, 260, 46);
-    lv_obj_align(btn_tone, LV_ALIGN_TOP_MID, 0, 62 + 5 * 62);
-    lv_obj_set_style_radius(btn_tone, 12, 0);
-    lv_obj_set_style_bg_color(btn_tone, lv_color_make(30, 24, 18), 0);
-    lv_obj_set_style_border_width(btn_tone, 1, 0);
-    lv_obj_set_style_border_color(btn_tone, ACCENT, 0);
-    lv_obj_set_style_shadow_width(btn_tone, 0, 0);
-    lv_obj_add_event_cb(btn_tone, tone_click_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *lbl_tone = lv_label_create(btn_tone);
-    lv_obj_set_style_text_font(lbl_tone, &ui_font_cjk_16, 0);
-    lv_obj_set_style_text_color(lbl_tone, ACCENT, 0);
-    lv_label_set_text(lbl_tone, "测试音 1kHz");
-    lv_obj_center(lbl_tone);
+    ui_gesture_hint_create(screen);
+}
 
-    lv_obj_add_flag(s_eq, LV_OBJ_FLAG_HIDDEN);
+lv_obj_t* ui_view_settings_about_create(void)
+{
+    if (s_about) return s_about;
+    s_about = ui_screen_create();
+    build_about_page(s_about);
+    return s_about;
+}
+
+void ui_view_settings_about_update(void)
+{
+    /* 纯静态信息，无需周期刷新 */
 }
 
 /* ---------------------------------------------------------------
- * 创建页面
+ * 创建设置页
  * --------------------------------------------------------------- */
 lv_obj_t* ui_view_settings_create(void)
 {
-    s_screen = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(s_screen, lv_color_black(), 0);
-    lv_obj_set_style_border_width(s_screen, 0, 0);
-    lv_obj_set_style_pad_all(s_screen, 0, 0);
+    s_screen = ui_screen_create();
+    lv_obj_t *page = ui_page_create(s_screen);
 
-    /* 顶部：返回 + 标题 */
-    lv_obj_t *btn_home = lv_btn_create(s_screen);
-    lv_obj_set_size(btn_home, 60, 40);
-    lv_obj_align(btn_home, LV_ALIGN_TOP_LEFT, 12, 8);
-    lv_obj_set_style_radius(btn_home, 10, 0);
-    lv_obj_set_style_bg_color(btn_home, lv_color_make(28, 28, 34), 0);
-    lv_obj_set_style_shadow_width(btn_home, 0, 0);
-    lv_obj_add_event_cb(btn_home, home_click_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *lbl_home = lv_label_create(btn_home);
-    lv_obj_set_style_text_font(lbl_home, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(lbl_home, ACCENT, 0);
-    lv_label_set_text(lbl_home, LV_SYMBOL_HOME);
-    lv_obj_center(lbl_home);
+    /* 导航头：屏幕 y=14 */
+    ui_nav_header_create(page, 14, "桌面", "系统设置", back_home_cb, NULL);
 
-    lv_obj_t *title = lv_label_create(s_screen);
-    lv_obj_set_style_text_font(title, &ui_font_cjk_20, 0);
-    lv_obj_set_style_text_color(title, lv_color_white(), 0);
-    lv_label_set_text(title, "系统设置");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 14);
+    /* 滚动列：屏幕 y=58，424x388，行间距 12 */
+    lv_obj_t *col = ui_scroll_column_create(page, COL_X, COL_Y, COL_W, COL_H, COL_GAP);
 
-    /* IMU 手势开关（右上角，可显示"未检测"） */
-    s_btn_imu = lv_btn_create(s_screen);
-    lv_obj_set_size(s_btn_imu, 132, 36);
-    lv_obj_align(s_btn_imu, LV_ALIGN_TOP_RIGHT, -14, 14);
-    lv_obj_set_style_radius(s_btn_imu, 10, 0);
-    lv_obj_set_style_bg_color(s_btn_imu, CARD_BG, 0);
-    lv_obj_set_style_border_width(s_btn_imu, 1, 0);
-    lv_obj_set_style_border_color(s_btn_imu, CARD_BORDER, 0);
-    lv_obj_set_style_shadow_width(s_btn_imu, 0, 0);
-    lv_obj_add_event_cb(s_btn_imu, imu_toggle_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *lbl_imu = lv_label_create(s_btn_imu);
-    lv_obj_set_style_text_font(lbl_imu, &ui_font_cjk_16, 0);
-    lv_obj_set_style_text_color(lbl_imu, lv_color_white(), 0);
-    lv_label_set_text(lbl_imu, "IMU 手势 开");
-    lv_obj_center(lbl_imu);
-
-    /* 屏幕亮度 6 档 */
-    make_section_label(s_screen, "屏幕亮度", 60);
-    const int bx[3] = { 14, 164, 314 };
-    for (int i = 0; i < 6; i++) {
-        char txt[8];
-        snprintf(txt, sizeof(txt), "%d%%", kBrightPct[i]);
-        int row = i / 3, col = i % 3;
-        s_btn_bright[i] = make_btn(s_screen, txt, 132, 54, bright_click_cb, i);
-        lv_obj_set_pos(s_btn_bright[i], bx[col], 88 + row * 62);
+    /* ① 屏幕亮度（固定 6 档，点击即时生效） */
+    {
+        lv_obj_t *c = card_begin(col, 90);
+        s_val_bright = card_header(c, "屏幕亮度 (固定6档)");
+        static const char *names[6] = { "10%", "30%", "50%", "70%", "90%", "100%" };
+        build_pill_row(c, names, 6, bright_click_cb, s_btn_bright);
     }
 
-    /* 自动息屏 */
-    make_section_label(s_screen, "自动息屏", 220);
-    for (int i = 0; i < 4; i++) {
-        s_btn_auto[i] = make_btn(s_screen, kAutoOffText[i], 100, 48, auto_click_cb, i);
-        lv_obj_set_pos(s_btn_auto[i], 14 + i * 110, 246);
+    /* ② 均衡器（5 预设）+ 测试音 */
+    {
+        lv_obj_t *c = card_begin(col, 116);
+        s_val_eq = card_header(c, "均衡器");
+        build_pill_row(c, kEqName, 5, eq_click_cb, s_btn_eq);
+
+        lv_obj_t *tone = ui_label_create(c, "测试音 1kHz", UI_FONT_CJK_S, UI_COL_TEXT3);
+        lv_obj_set_width(tone, 220);
+        lv_label_set_long_mode(tone, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_align(tone, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_obj_align(tone, LV_ALIGN_BOTTOM_RIGHT, -CARD_PAD_X, -10);
+        lv_obj_add_flag(tone, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(tone, tone_click_cb, LV_EVENT_CLICKED, NULL);
     }
 
-    /* 音量上限（固定） */
-    lv_obj_t *vol = lv_label_create(s_screen);
-    lv_obj_set_style_text_font(vol, &ui_font_cjk_16, 0);
-    lv_obj_set_style_text_color(vol, TEXT_DIM, 0);
-    lv_label_set_text(vol, "音量上限：85%（固定）");
-    lv_obj_align(vol, LV_ALIGN_TOP_LEFT, 16, 312);
+    /* ③ 自动息屏时间（4 档） */
+    {
+        lv_obj_t *c = card_begin(col, 90);
+        s_val_auto = card_header(c, "自动息屏时间");
+        build_pill_row(c, kAutoOffText, 4, auto_click_cb, s_btn_auto);
+    }
 
-    /* 均衡器 + 关于本设备（并排） */
-    lv_obj_t *btn_eq = lv_btn_create(s_screen);
-    lv_obj_set_size(btn_eq, 210, 56);
-    lv_obj_align(btn_eq, LV_ALIGN_TOP_LEFT, 14, 350);
-    lv_obj_set_style_radius(btn_eq, 12, 0);
-    lv_obj_set_style_bg_color(btn_eq, CARD_BG, 0);
-    lv_obj_set_style_border_width(btn_eq, 1, 0);
-    lv_obj_set_style_border_color(btn_eq, CARD_BORDER, 0);
-    lv_obj_set_style_shadow_width(btn_eq, 0, 0);
-    lv_obj_add_event_cb(btn_eq, eq_open_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *lbl_eq = lv_label_create(btn_eq);
-    lv_obj_set_style_text_font(lbl_eq, &ui_font_cjk_16, 0);
-    lv_obj_set_style_text_color(lbl_eq, lv_color_white(), 0);
-    lv_label_set_text(lbl_eq, "均衡器  >");
-    lv_obj_center(lbl_eq);
+    /* ④ 手势感应 IMU（开 / 关 + 一行说明） */
+    {
+        lv_obj_t *c = card_begin(col, 114);
+        s_val_imu = card_header(c, "手势感应 IMU");
+        static const char *names[2] = { "开", "关" };
+        build_pill_row(c, names, 2, imu_click_cb, s_btn_imu);
+        note_line(c, "手势切歌 / 音量 / 播放暂停；关闭后仅保留芯片检测", 82);
+    }
 
-    lv_obj_t *btn_about = lv_btn_create(s_screen);
-    lv_obj_set_size(btn_about, 210, 56);
-    lv_obj_align(btn_about, LV_ALIGN_TOP_LEFT, 236, 350);
-    lv_obj_set_style_radius(btn_about, 12, 0);
-    lv_obj_set_style_bg_color(btn_about, CARD_BG, 0);
-    lv_obj_set_style_border_width(btn_about, 1, 0);
-    lv_obj_set_style_border_color(btn_about, CARD_BORDER, 0);
-    lv_obj_set_style_shadow_width(btn_about, 0, 0);
-    lv_obj_add_event_cb(btn_about, about_open_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *lbl_about = lv_label_create(btn_about);
-    lv_obj_set_style_text_font(lbl_about, &ui_font_cjk_16, 0);
-    lv_obj_set_style_text_color(lbl_about, lv_color_white(), 0);
-    lv_label_set_text(lbl_about, "关于本设备  >");
-    lv_obj_center(lbl_about);
+    /* ⑤ 防爆耳高音量限额（固定 85%） */
+    {
+        lv_obj_t *c = card_begin(col, 74);
+        lv_obj_t *v = card_header(c, "防爆耳高音量限额");
+        lv_label_set_text(v, "85% 锁");
+        note_line(c, "限制单档手势最高调节至 85%，保护听力与耳塞单元", 42);
+    }
 
-    build_about(s_screen);
-    build_eq(s_screen);
+    /* ⑥ 系统时钟同步（三行说明 + 一键对时） */
+    {
+        lv_obj_t *c = card_begin(col, 126);
+        lv_obj_t *t = ui_label_create(c, "系统时钟同步", UI_FONT_CJK_S, UI_COL_TEXT);
+        lv_obj_set_width(t, 240);
+        lv_label_set_long_mode(t, LV_LABEL_LONG_DOT);
+        lv_obj_set_pos(t, CARD_PAD_X, HEAD_Y);
 
-    refresh_bright_styles();
-    refresh_auto_styles();
-    imu_refresh_label();
+        lv_obj_t *pill = ui_pill_create(c, 0, 0, 96, 28,
+                                        UI_COL_ACCENT_SOFT, UI_COL_ACCENT_LINE);
+        lv_obj_align(pill, LV_ALIGN_TOP_RIGHT, -CARD_PAD_X, 12);
+        lv_obj_t *plbl = ui_label_create(pill, "一键对时", UI_FONT_CJK_S, UI_COL_ACCENT);
+        lv_obj_center(plbl);
+        lv_obj_add_event_cb(pill, sync_click_cb, LV_EVENT_CLICKED, NULL);
+
+        note_line(c, "方式 1: 手机蓝牙配对自动同步 (Apple CTS / Android)", 48);
+        note_line(c, "方式 2: Type-C 连接电脑 USB 声卡时静默校准", 68);
+        note_line(c, "方式 3: 内部 RTC 超低功耗走时（息屏不丢时间）", 88);
+    }
+
+    /* ⑦ 关于（整行可点） */
+    {
+        lv_obj_t *c = card_begin(col, 56);
+        lv_obj_t *t = ui_label_create(c, "关于", UI_FONT_CJK_S, UI_COL_TEXT);
+        lv_obj_set_width(t, 200);
+        lv_label_set_long_mode(t, LV_LABEL_LONG_DOT);
+        lv_obj_align(t, LV_ALIGN_LEFT_MID, CARD_PAD_X, 0);
+
+        lv_obj_t *arrow = ui_label_create(c, LV_SYMBOL_RIGHT, UI_FONT_SM, UI_COL_TEXT3);
+        lv_obj_align(arrow, LV_ALIGN_RIGHT_MID, -CARD_PAD_X, 0);
+
+        lv_obj_t *model = ui_label_create(c, "FAKE POD NANO", UI_FONT_SM, UI_COL_TEXT2);
+        lv_obj_set_width(model, 200);
+        lv_label_set_long_mode(model, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_align(model, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_obj_align_to(model, arrow, LV_ALIGN_OUT_LEFT_MID, -8, 0);
+
+        ui_press_feedback(c);
+        lv_obj_add_event_cb(c, about_open_cb, LV_EVENT_CLICKED, NULL);
+    }
+
+    ui_gesture_hint_create(s_screen);
+
+    /* 首次同步当前状态（sim 假数据：背光 70%、自动息屏 30s、IMU 开、EQ=0） */
+    refresh_bright();
+    refresh_auto();
+    refresh_eq();
+    refresh_imu();
+
     return s_screen;
 }
 
 void ui_view_settings_update(void)
 {
-    refresh_bright_styles();
-    refresh_auto_styles();
-    imu_refresh_label();
+    refresh_bright();
+    refresh_auto();
+    refresh_eq();
+    refresh_imu();
 }

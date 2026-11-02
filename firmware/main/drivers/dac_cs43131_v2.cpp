@@ -24,6 +24,10 @@ static const char *TAG = "CS43131V2";
 
 static i2c_master_dev_handle_t s_dev = NULL;
 
+/* bring-up 探测档位：bit0=v4 风格 16bit 帧编码, bit1=打开耳机检测, bit2=外部 24.576M 时钟 */
+static int s_probe_profile = 0;
+void cs43131_set_probe_profile(int profile) { s_probe_profile = profile; }
+
 static esp_err_t w(uint32_t addr, uint8_t val)
 {
     if (!s_dev) {
@@ -34,7 +38,7 @@ static esp_err_t w(uint32_t addr, uint8_t val)
         (uint8_t)((addr >> 16) & 0xFF),
         (uint8_t)((addr >> 8) & 0xFF),
         (uint8_t)(addr & 0xFF),
-        0x01,
+        0x00,           /* 原厂写帧第 4 字节 = 0x00（不是 0x01） */
         val
     };
     esp_err_t ret = ESP_FAIL;
@@ -54,7 +58,7 @@ static esp_err_t r(uint32_t addr, uint8_t *out)
         (uint8_t)((addr >> 16) & 0xFF),
         (uint8_t)((addr >> 8) & 0xFF),
         (uint8_t)(addr & 0xFF),
-        0x01
+        0x00            /* 原厂读帧第 4 字节 = 0x00 */
     };
     for (int i = 0; i < 3; i++) {
         if (i2c_master_transmit_receive(s_dev, a, sizeof(a), out, 1, 100) == ESP_OK) return ESP_OK;
@@ -142,7 +146,7 @@ esp_err_t cs43131_init_v2(i2c_master_bus_handle_t i2c_bus, uint32_t sample_rate,
      *    后续所有传输返回 ESP_ERR_INVALID_STATE（总线级失败），说明本板
      *    24.576M 晶振通路不可用，必须留在 RCO。
      */
-    w(0x010006, 0x06);
+    w(0x010006, (s_probe_profile & 4) ? 0x00 : 0x06);
 
     /* 4. 晶振偏置（page2/0x52） */
     w(0x020052, 0x04);
@@ -160,7 +164,7 @@ esp_err_t cs43131_init_v2(i2c_master_bus_handle_t i2c_bus, uint32_t sample_rate,
 
     /* 4. 串口采样率与位宽 */
     w(0x01000B, srate_idx(sample_rate));
-    w(0x01000C, bitsize_val(bits));
+    w(0x01000C, (s_probe_profile & 1) ? (bits > 16 ? 0x01 : 0x04) : bitsize_val(bits));
     w(0x01000D, 0x03);            /* PAD_INT_CFG 默认 */
 
     /* 5. 晶振偏置（内部 RCO 时保持默认） */
@@ -175,7 +179,7 @@ esp_err_t cs43131_init_v2(i2c_master_bus_handle_t i2c_bus, uint32_t sample_rate,
     w(0x040016, 0x3F); w(0x040017, 0x00);
 
     /* 7. ASP 通道位宽 + 使能（0x04 = CH_EN） */
-    uint8_t ch = ch_size_val(bits);
+    uint8_t ch = (s_probe_profile & 1) ? (bits > 16 ? 0x02 : 0x03) : ch_size_val(bits);
     w(0x05000A, (uint8_t)(ch | 0x04));
     w(0x05000B, (uint8_t)(ch | 0x04));
 
@@ -186,7 +190,7 @@ esp_err_t cs43131_init_v2(i2c_master_bus_handle_t i2c_bus, uint32_t sample_rate,
     /* 9. 耳放与 Class-H */
     w(0x080000, 0x38);            /* HP_OUT_CTL_1: 0x30 | HP_IN_EN(0x08) */
     w(0x0B0000, 0x1E);            /* CLASS_H_CTL 默认 */
-    w(0x0D0000, 0x00);            /* HP_DETECT：关闭耳机检测，避免无负载判定静音 */
+    w(0x0D0000, (s_probe_profile & 2) ? 0x01 : 0x00);  /* HP_DETECT：默认关，探测档位2打开 */
     w(0x0E0000, 0x00);            /* HP_LOAD_1 */
 
     /* 10. 上电：ASP/HP/XTAL/PLL 全部上电（XSP/DSDIF 保持断电） */
@@ -240,5 +244,108 @@ esp_err_t cs43131_init_v2(i2c_master_bus_handle_t i2c_bus, uint32_t sample_rate,
     }
 
     ESP_LOGI(TAG, "初始化完成（%lu Hz / %d bit，ASP 从模式）", (unsigned long)sample_rate, bits);
+    return ESP_OK;
+}
+
+/* ---------------------------------------------------------------
+ * 原厂初始化序列复刻（从 OTA 反汇编 0x4201bf9c 起逐条提取）
+ *   - page3 关闭、ASP 通道宽度、晶振偏置、0F0010 中断掩码、
+ *     电源 F6→F2→99、PCM 通路 0x090000/0x090003/0x090001、
+ *     class-H 0x0B0000=0x1E、耳放 0x080000=0x30、0x01000D=0x02、
+ *     pop-free 0x080032、时钟源 0x010006=0x04（外部晶振 22.5792M）
+ * --------------------------------------------------------------- */
+/* 轮询中断状态寄存器 0x0F0000 的指定位（bit4=XTAL_RDY, bit2=PLL_RDY） */
+static bool vendor_wait_ready(uint8_t mask, int timeout_ms)
+{
+    TickType_t t0 = xTaskGetTickCount();
+    while ((xTaskGetTickCount() - t0) < pdMS_TO_TICKS(timeout_ms)) {
+        uint8_t s = 0;
+        if (r(0x0F0000, &s) == ESP_OK && (s & mask) == mask) return true;
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    return false;
+}
+
+esp_err_t cs43131_init_vendor(i2c_master_bus_handle_t i2c_bus, uint32_t sample_rate, uint8_t bits)
+{
+    if (!i2c_bus) return ESP_ERR_INVALID_ARG;
+
+    if (!s_dev) {
+        i2c_device_config_t cfg = {};
+        cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+        cfg.device_address = CS43131_I2C_ADDR;
+        cfg.scl_speed_hz = 100 * 1000;
+        esp_err_t e = i2c_master_bus_add_device(i2c_bus, &cfg, &s_dev);
+        if (e != ESP_OK) return e;
+    }
+    cs43131_set_i2c_dev_handle(s_dev);
+
+    gpio_config_t io = {};
+    io.pin_bit_mask = (1ULL << AUDIO_DAC_RST_PIN);
+    io.mode = GPIO_MODE_OUTPUT;
+    gpio_config(&io);
+    gpio_set_level((gpio_num_t)AUDIO_DAC_RST_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(15));
+    gpio_set_level((gpio_num_t)AUDIO_DAC_RST_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(60));
+
+    uint8_t srate = (sample_rate == 32000) ? 0 :
+                    (sample_rate == 44100) ? 1 :
+                    (sample_rate == 48000) ? 2 :
+                    (sample_rate == 88200) ? 3 :
+                    (sample_rate == 96000) ? 4 : 1;
+    w(0x01000B, srate);
+    w(0x01000C, (bits >= 24) ? 0x06 : 0x04);
+
+    w(0x030002, 0x00); w(0x030003, 0x00); w(0x030004, 0x00);
+    w(0x030005, 0x00); w(0x030008, 0x00); w(0x03000A, 0x00);
+    w(0x030001, 0x01);
+
+    w(0x05000A, (bits >= 24) ? 0x06 : 0x05);
+    w(0x05000B, 0x0D); w(0x05000B, 0x06); w(0x05000B, 0x0E);
+    w(0x05000B, 0x07); w(0x05000B, 0x0F);
+
+    w(0x020052, 0x04);      /* 晶振偏置 */
+    w(0x0F0010, 0xE7);      /* 中断掩码 */
+
+    /* 电源时序：原厂每一步之后都要等时钟就绪，必须轮询，不能裸写 */
+    w(0x020000, 0xF6);
+    bool xtal = vendor_wait_ready(0x10, 80);      /* XTAL_RDY */
+    w(0x020000, 0xF2);
+    bool pll = vendor_wait_ready(0x14, 80);       /* XTAL_RDY | PLL_RDY */
+    w(0x0F0010, 0xE1);
+    ESP_LOGI(TAG, "电源时序: XTAL_READY=%d PLL_READY=%d", xtal ? 1 : 0, pll ? 1 : 0);
+
+    w(0x040010, 0x01); w(0x040011, 0x00); w(0x040012, 0x08); w(0x040013, 0x00);
+    w(0x040014, 0x1F); w(0x040015, 0x00); w(0x040016, 0x3F); w(0x040017, 0x00);
+    w(0x040018, 0x0C); w(0x040019, 0x0A);
+    w(0x050000, 0x00); w(0x050001, 0x00);
+
+    w(0x090000, 0x02);
+    w(0x090000, 0x10);
+    w(0x090003, 0xE0);
+    w(0x090004, 0x00);
+    w(0x090001, 0x03);
+    w(0x0B0000, 0x1E);
+    w(0x080000, 0x30);
+    w(0x01000D, 0x02);
+
+    w(0x020000, 0x99);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    w(0x080032, 0x20);
+    vTaskDelay(pdMS_TO_TICKS(15));
+    w(0x080032, 0x00);
+    w(0x010010, 0x00);
+
+    /* 原厂最终写 0x010006=0x04（外部晶振 22.5792M）。本板用内部 RCO 同频 0x06，
+     * 频率相同但不会因晶振未起振导致 I2C 失联。 */
+    w(0x010006, 0x06);
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    uint8_t pwr = 0, hp = 0, bs = 0, clk = 0, ch1 = 0, srr = 0, mut = 0;
+    r(0x020000, &pwr); r(0x080000, &hp); r(0x01000C, &bs);
+    r(0x010006, &clk); r(0x05000A, &ch1); r(0x01000B, &srr); r(0x090003, &mut);
+    ESP_LOGI(TAG, "原厂序列完成: PWR=0x%02X HP=0x%02X BITS=0x%02X CLK=0x%02X CH1=0x%02X SRATE=0x%02X MUTE=0x%02X (%lu Hz/%d bit)",
+             pwr, hp, bs, clk, ch1, srr, mut, (unsigned long)sample_rate, bits);
     return ESP_OK;
 }

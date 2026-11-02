@@ -277,7 +277,9 @@ static esp_err_t panel_qspi_amoled_draw_bitmap(esp_lcd_panel_t *panel, int x_sta
     }, 4), TAG, "send command failed");
     // transfer frame buffer
     size_t len = (x_end - x_start) * (y_end - y_start) * qspi_amoled->fb_bits_per_pixel / 8;
-    tx_color(qspi_amoled, io, LCD_CMD_RAMWR, color_data, len);
+    /* 原来这里忽略了返回值：一旦颜色事务被驱动拒绝（长度超限 / cache 关闭等），
+     * on_color_trans_done 就永远不会触发，上层"等 DMA 完成"会白等到超时。 */
+    ESP_RETURN_ON_ERROR(tx_color(qspi_amoled, io, LCD_CMD_RAMWR, color_data, len), TAG, "send color failed");
 
     return ESP_OK;
 }

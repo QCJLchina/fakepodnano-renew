@@ -3,7 +3,10 @@ tools/
 
 # Build artifacts
 **/build/
+**/build_*/
 **/sdkconfig.old
+sim/out/
+node_modules/
 
 # Archives & backups
 *.zip

@@ -68,7 +68,7 @@ static esp_err_t write_reg(uint32_t addr, uint8_t dat)
     buf[0] = (addr >> 16) & 0xFF;
     buf[1] = (addr >> 8) & 0xFF;
     buf[2] = addr & 0xFF;
-    buf[3] = 0x01;  /* 控制字节，固定 0x01 */
+    buf[3] = 0x00;  /* 原厂写帧第 4 字节为 0x00（不是 0x01），见 OTA 反汇编 0x4201c080 */
     buf[4] = dat;
 
     esp_err_t ret = ESP_FAIL;
@@ -91,7 +91,7 @@ static esp_err_t read_reg(uint32_t addr, uint8_t *dst)
     write_buf[0] = (addr >> 16) & 0xFF;
     write_buf[1] = (addr >> 8) & 0xFF;
     write_buf[2] = addr & 0xFF;
-    write_buf[3] = 0x01;  /* 控制字节，固定 0x01 */
+    write_buf[3] = 0x00;  /* 原厂读帧第 4 字节为 0x00 */
 
     esp_err_t ret = ESP_FAIL;
     for (int i = 0; i < I2C_RETRY_COUNT; i++) {

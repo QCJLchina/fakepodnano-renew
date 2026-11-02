@@ -104,6 +104,12 @@ int audio_pipeline_get_eq(void);
  */
 esp_err_t audio_pipeline_play_test_tone(uint32_t freq_hz, uint32_t ms, uint8_t volume_pct);
 
+/**
+ * @brief bring-up 诊断：依次套用 5 种 DAC 初始化档位，各播 1.2s 1kHz 测试音，
+ *        用于在硬件上找出能出声的 CS43131 配置。
+ */
+void audio_pipeline_dac_probe(void);
+
 #ifdef __cplusplus
 }
 #endif

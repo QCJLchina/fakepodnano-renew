@@ -13,6 +13,9 @@
 #include "esp_log.h"
 #include "driver/sdmmc_host.h"
 #include "sdmmc_cmd.h"
+#include "esp_private/usb_phy.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <string.h>
 
 /* TF 卡 SDMMC 引脚（与 main/board/board_config.h 保持一致；
@@ -27,6 +30,26 @@
 static const char *TAG = "USB_MSC";
 static sdmmc_card_t s_card_storage;
 static sdmmc_card_t *s_card = NULL;
+static usb_phy_handle_t s_phy_hdl = NULL;
+
+static void usb_phy_init(void)
+{
+    usb_phy_config_t phy_conf = {
+        .controller = USB_PHY_CTRL_OTG,
+        .target = USB_PHY_TARGET_INT,
+        .otg_mode = USB_OTG_MODE_DEVICE,
+        .otg_speed = USB_PHY_SPEED_FULL,
+    };
+    usb_new_phy(&phy_conf, &s_phy_hdl);
+}
+
+static void usb_msc_task(void *arg)
+{
+    (void)arg;
+    while (1) {
+        tud_task();
+    }
+}
 
 esp_err_t usb_msc_mode_start(void)
 {
@@ -50,17 +73,25 @@ esp_err_t usb_msc_mode_start(void)
     if (err != ESP_OK) { ESP_LOGE(TAG, "sdmmc_host_init_slot 失败: %s", esp_err_to_name(err)); return err; }
 
     err = sdmmc_card_init(&host, &s_card_storage);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "TF 卡初始化失败: %s（请插卡后重启）", esp_err_to_name(err));
-        return err;
+    if (err == ESP_OK) {
+        s_card = &s_card_storage;
+        ESP_LOGI(TAG, "TF 卡就绪，容量 %llu 扇区 (约 %.1f GB)",
+                 (unsigned long long)s_card->csd.capacity,
+                 (double)s_card->csd.capacity * 512.0 / (1024.0 * 1024.0 * 1024.0));
+    } else {
+        s_card = NULL;
+        ESP_LOGW(TAG, "TF 卡未插入或初始化未完成: %s（USB 将以可移动磁盘枚举，插入 TF 卡后即可读写）", esp_err_to_name(err));
     }
-    s_card = &s_card_storage;
-    ESP_LOGI(TAG, "TF 卡就绪，容量 %llu 扇区", (unsigned long long)s_card->csd.capacity);
+
+    usb_phy_init();
 
     if (!tusb_init()) {
         ESP_LOGE(TAG, "tusb_init 失败");
         return ESP_FAIL;
     }
+
+    xTaskCreatePinnedToCore(usb_msc_task, "usb_msc", 4096, NULL, 5, NULL, 0);
+
     ESP_LOGI(TAG, "USB U盘(MSC) 模式已启动，插电脑应出现可移动磁盘");
     return ESP_OK;
 }
@@ -84,6 +115,27 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *
     if (nsec == 0) return 0;
     if (sdmmc_write_sectors(s_card, buffer, lba, nsec) != ESP_OK) return 0;
     return bufsize;
+}
+
+void tud_mount_cb(void)
+{
+    ESP_LOGI(TAG, ">>> USB 已挂载至电脑主机 (Mounted) <<<");
+}
+
+void tud_umount_cb(void)
+{
+    ESP_LOGI(TAG, ">>> USB 已从电脑主机卸载 (Unmounted) <<<");
+}
+
+void tud_suspend_cb(bool remote_wakeup_en)
+{
+    (void)remote_wakeup_en;
+    ESP_LOGI(TAG, ">>> USB 总线挂起 (Suspended) <<<");
+}
+
+void tud_resume_cb(void)
+{
+    ESP_LOGI(TAG, ">>> USB 总线恢复 (Resumed) <<<");
 }
 
 /* 容量查询（TinyUSB 内置 READ_CAPACITY 走这里） */
