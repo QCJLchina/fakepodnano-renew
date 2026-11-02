@@ -8,6 +8,10 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include <strings.h>
+#include <dirent.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -221,6 +225,96 @@ esp_err_t player_play(const char *filepath)
     xSemaphoreGive(s_mutex);
 
     return ESP_OK;
+}
+
+/* ---------------------------------------------------------------
+ * 上一首 / 下一首：扫描当前曲目所在目录内的可播放文件，循环切换
+ * --------------------------------------------------------------- */
+static bool svc_name_playable(const char *name)
+{
+    const char *ext = strrchr(name, '.');
+    if (!ext) return false;
+    char e[8];
+    size_t n = strlen(ext);
+    if (n >= sizeof(e)) return false;
+    for (size_t i = 0; i <= n; i++) e[i] = (char)tolower((unsigned char)ext[i]);
+    return !strcmp(e, ".wav") || !strcmp(e, ".flac") ||
+           !strcmp(e, ".mp3") || !strcmp(e, ".aac") || !strcmp(e, ".m4a") ||
+           !strcmp(e, ".dsf") || !strcmp(e, ".dsd");
+}
+
+static int svc_name_cmp(const void *a, const void *b)
+{
+    return strcasecmp((const char *)a, (const char *)b);
+}
+
+static esp_err_t play_sibling(int step)
+{
+    if (!s_task_handle) return ESP_ERR_INVALID_STATE;
+
+    char cur[256];
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    snprintf(cur, sizeof(cur), "%s", s_status.current_path);
+    xSemaphoreGive(s_mutex);
+    if (cur[0] == '\0') return ESP_ERR_INVALID_STATE;
+
+    const char *slash = strrchr(cur, '/');
+    if (!slash) return ESP_ERR_INVALID_STATE;
+    char dir[256];
+    size_t dl = (size_t)(slash - cur);
+    if (dl == 0 || dl >= sizeof(dir)) return ESP_ERR_INVALID_STATE;
+    memcpy(dir, cur, dl);
+    dir[dl] = '\0';
+    const char *base = slash + 1;
+
+    DIR *dp = opendir(dir);
+    if (!dp) return ESP_FAIL;
+
+    const int max_tracks = 200;
+    const int name_len = 128;
+    char *names = (char *)malloc((size_t)max_tracks * name_len);
+    if (!names) {
+        closedir(dp);
+        return ESP_ERR_NO_MEM;
+    }
+
+    int count = 0;
+    struct dirent *ent;
+    while ((ent = readdir(dp)) != NULL && count < max_tracks) {
+        if (ent->d_name[0] == '.') continue;
+        if (!svc_name_playable(ent->d_name)) continue;
+        strncpy(names + count * name_len, ent->d_name, name_len - 1);
+        names[count * name_len + (name_len - 1)] = '\0';
+        count++;
+    }
+    closedir(dp);
+
+    esp_err_t ret = ESP_ERR_NOT_FOUND;
+    if (count > 0) {
+        qsort(names, (size_t)count, name_len, svc_name_cmp);
+        int idx = -1;
+        for (int i = 0; i < count; i++) {
+            if (!strcmp(names + i * name_len, base)) { idx = i; break; }
+        }
+        if (idx < 0) idx = 0;
+        int ni = (idx + step + count) % count;
+        char full[512];
+        snprintf(full, sizeof(full), "%s/%s", dir, names + ni * name_len);
+        ret = player_play(full);
+    }
+
+    free(names);
+    return ret;
+}
+
+esp_err_t player_next(void)
+{
+    return play_sibling(+1);
+}
+
+esp_err_t player_prev(void)
+{
+    return play_sibling(-1);
 }
 
 esp_err_t player_pause(void)

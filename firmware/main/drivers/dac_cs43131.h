@@ -48,6 +48,46 @@ extern "C" {
 esp_err_t cs43131_init(i2c_master_bus_handle_t i2c_bus);
 
 /**
+ * @brief 依据官方寄存器定义重写的完整初始化（v2）：配置 ASP 从模式、
+ *        串口位宽、通道使能、耳放与 Class-H，并关闭耳机检测。
+ */
+esp_err_t cs43131_init_v2(i2c_master_bus_handle_t i2c_bus, uint32_t sample_rate, uint8_t bits);
+
+/**
+ * @brief 依照 AUDIO_CHAIN.md 逆向结果实现的初始化（v4）：
+ *        探测 0x30~0x33 + DevId 校验 → 上电 → 晶振起振(清 bit3/bit4,
+ *        等 INT_STATUS1.bit3) → 切 24.576MHz 外部时钟 → 原厂 16 项 ASP 表
+ *        → 普通耳机耳放档位 (classH=0x20, hp=0x1C)。
+ */
+esp_err_t cs43131_init_v4(i2c_master_bus_handle_t i2c_bus, uint32_t sample_rate);
+
+/**
+ * @brief ASP 参数扫描：按序号套用一组 (SP_SRATE, ASP_CLOCK_CONF, ASP_FRAME_CONF)。
+ *        用于在硬件上自动找出能出声的组合。idx 超范围返回错误。
+ */
+esp_err_t cs43131_asp_try(int idx);
+int cs43131_asp_count(void);
+
+/** @brief 时钟源扫描：写 SYS_CLK_CTL_1 候选值并验证 I2C 是否失联（失联自动回退） */
+esp_err_t cs43131_clock_try(int idx);
+int cs43131_clock_count(void);
+
+/** @brief 按采样率/位深配置串口与 ASP（44.1k/16bit 为已确认可用基准档） */
+esp_err_t cs43131_set_stream(uint32_t sample_rate, uint8_t bits);
+
+/**
+ * @brief 按音频位宽重新配置 DAC 的串口位宽/通道位宽/ASP 分频
+ *        （16bit 用 32bit 帧 DEN=16；24/32bit 用 64bit 帧 DEN=8）
+ */
+esp_err_t cs43131_set_word_bits(uint8_t bits);
+
+/**
+ * @brief 让音量/静音等旧接口复用 v2 初始化里创建的 I2C 设备句柄
+ *        （v2 自己建句柄，不共享会导致音量写入静默失败）
+ */
+void cs43131_set_i2c_dev_handle(i2c_master_dev_handle_t dev);
+
+/**
  * @brief 读取 CS43131 芯片 ID（用于验证 I2C 通信）
  * @param[out] id 读到的 ID
  */

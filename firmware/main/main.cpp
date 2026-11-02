@@ -19,12 +19,28 @@
 #include "ui_manager.h"
 #include "usb_uac_service.h"
 #include "ble_time_sync.h"
+#include "button_service.h"
+#include "battery_service.h"
+#include "imu_service.h"
+#include "usb_msc_dev.h"
 
 static const char *TAG = "MAIN";
 
 extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "===== FAKE_POD_NANO 启动 =====");
+
+#if CONFIG_FAKEPOD_USB_MSC_MODE
+    /* ===== U盘(MSC) 模式固件：只初始化存储并把设备作为 U 盘暴露 ===== */
+    nvs_flash_init();
+    {
+        esp_err_t msc_err = usb_msc_mode_start();
+        ESP_LOGI(TAG, "U盘模式启动%s", (msc_err == ESP_OK) ? "成功（插电脑应出现可移动磁盘）" : "失败（见上方日志）");
+    }
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+#endif
 
     /* 1. NVS */
     esp_err_t err = nvs_flash_init();
@@ -40,6 +56,9 @@ extern "C" void app_main(void)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "板级初始化失败: %s", esp_err_to_name(err));
     }
+
+    /* 2.5 电池电量检测（BAT_ADC=GPIO1） */
+    battery_service_init();
 
     /* 3. 屏幕与全新 UI 管理器初始化 */
     esp_lcd_panel_handle_t panel = NULL;
@@ -63,18 +82,30 @@ extern "C" void app_main(void)
     /* 5. 启动音频播放管理服务 (WAV/FLAC/MP3/AAC/DSD) */
     err = player_service_init();
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "本地播放就绪：WAV / FLAC / MP3 / ADTS AAC。裸 M4A 与 DSD 会拒绝");
+        ESP_LOGI(TAG, "本地播放就绪：WAV / FLAC / MP3 / AAC(ADTS) / M4A");
     } else {
         ESP_LOGE(TAG, "音频播放服务启动失败: %s", esp_err_to_name(err));
     }
 
-    /* 6. 启动 USB 声卡。全速下最高 96 kHz / 24-bit，并与本地播放互斥。 */
-    err = usb_uac_service_start();
+    /* 5.5 物理按键服务（FN=BTN_PIN，另含电源键候选 GPIO0 的探测日志） */
+    err = button_service_start();
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "USB 声卡已在线 (44.1k ~ 96kHz, 24-bit)");
+        ESP_LOGI(TAG, "物理按键服务已启动（按下按键会打印 GPIO 日志）");
     } else {
-        ESP_LOGW(TAG, "USB 声卡服务启动跳过或失败: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "物理按键服务启动失败: %s", esp_err_to_name(err));
     }
+
+    /* 5.6 IMU 手势服务（QMI8658：左右倾切歌 / 上下倾音量 / 双击播放暂停） */
+    err = imu_service_start();
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "IMU 手势服务已启动");
+    } else {
+        ESP_LOGW(TAG, "IMU 手势服务启动失败: %s", esp_err_to_name(err));
+    }
+
+    /* 6. USB 声卡按需启动：开机不占用 USB/I2S，只有进入「USB DAC」页面时才启用。
+     *    这样开机默认是本地播放器，也不会抢占 USB 串口（方便抓日志/烧录）。 */
+    ESP_LOGI(TAG, "USB 声卡待命：进入 USB DAC 页面后启用");
 
     /* 7. 挂载 TF 卡并播放根目录第一首 wav/flac/mp3/aac。USB 正在占用 I2S 时会拒绝。 */
     err = sd_library_mount();

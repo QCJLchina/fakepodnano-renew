@@ -35,5 +35,14 @@ private:
     uint64_t m_total_samples;
     uint64_t m_current_samples;
 
+    /* M4A（MP4 容器）支持 */
+    bool m_is_mp4;
+    uint64_t *m_off;        /* 每个 AAC sample 的文件偏移 */
+    uint32_t *m_size;       /* 每个 sample 的字节数 */
+    uint32_t m_count;       /* sample 总数 */
+    uint32_t m_idx;         /* 当前 sample 索引 */
+    uint32_t m_timescale;   /* mdhd timescale */
+
     bool parse_container();
+    bool parse_mp4(FILE *f);
 };

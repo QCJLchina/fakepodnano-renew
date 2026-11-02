@@ -87,6 +87,23 @@ uint8_t audio_pipeline_get_volume(void);
  */
 esp_err_t audio_pipeline_set_mute(bool mute);
 
+/**
+ * @brief 设置均衡器预设
+ * @param preset 0=关闭 1=流行 2=摇滚 3=古典 4=人声
+ */
+esp_err_t audio_pipeline_set_eq(int preset);
+
+/** @brief 当前均衡器预设 */
+int audio_pipeline_get_eq(void);
+
+/**
+ * @brief 播放一段测试正弦音（用于排查 DAC/耳放通路，不经过 USB）
+ * @param freq_hz    频率，如 1000
+ * @param ms         时长毫秒
+ * @param volume_pct 硬件音量 0~100
+ */
+esp_err_t audio_pipeline_play_test_tone(uint32_t freq_hz, uint32_t ms, uint8_t volume_pct);
+
 #ifdef __cplusplus
 }
 #endif

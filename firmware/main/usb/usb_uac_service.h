@@ -29,6 +29,16 @@ esp_err_t usb_uac_service_start(void);
 esp_err_t usb_uac_service_stop(void);
 
 /**
+ * @brief 查询当前 USB 声卡是否已启动（TinyUSB 一旦初始化就无法干净卸载）
+ */
+bool usb_uac_service_is_started(void);
+
+/**
+ * @brief 累计从电脑收到的音频字节数（用于屏显诊断：是否真有数据流入）
+ */
+uint64_t usb_uac_get_rx_bytes(void);
+
+/**
  * @brief 查询当前 USB 声卡是否已与电脑连接并正在推流
  */
 bool usb_uac_is_streaming(void);

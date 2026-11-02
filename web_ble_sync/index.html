@@ -233,6 +233,24 @@
       <span>⚡ 搜索并一键对时</span>
     </button>
 
+    <!-- 固件升级 (BLE OTA) -->
+    <div class="card" style="border-color: rgba(10,132,255,0.28);">
+      <div class="clock-title" style="color:#0a84ff;">固件升级 (BLE OTA)</div>
+      <input id="fwFile" type="file" accept=".bin" style="width:100%;margin:10px 0;color:#aeaeb2;font-size:13px;">
+      <button class="btn-sync" id="btnOta" onclick="startOta()" style="background:linear-gradient(135deg,#0a84ff,#0060df);color:#fff;">
+        <span>⬆ 上传并升级</span>
+      </button>
+      <div style="margin-top:12px;">
+        <div style="height:10px;background:#111216;border-radius:6px;overflow:hidden;border:1px solid rgba(255,255,255,0.08);">
+          <div id="otaBar" style="height:100%;width:0%;background:linear-gradient(135deg,#0a84ff,#30d158);transition:width .15s;"></div>
+        </div>
+        <div id="otaPct" style="font-size:12px;color:#8e8e93;margin-top:6px;">未开始</div>
+      </div>
+      <div style="font-size:12px;color:#636366;margin-top:10px;line-height:1.6;">
+        选择编译出的 <code>fakepodnano.bin</code> 上传；升级期间请勿断连，完成后设备会自动重启。
+      </div>
+    </div>
+
     <!-- 实时交互日志 -->
     <div class="log-box" id="logBox">
       <div class="log-line info">[准备就绪] 正在等待点击对时...</div>
@@ -255,6 +273,12 @@
      * ============================================================ */
     const BLE_SERVICE_UUID = "0000ffe0-0000-1000-8000-00805f9b34fb";
     const BLE_CHAR_TIME_UUID = "0000ffe1-0000-1000-8000-00805f9b34fb";
+
+    /* BLE OTA：0xFFF0 / 控制 0xFFF1 / 数据 0xFFF2 / 状态 0xFFF3 */
+    const BLE_OTA_SERVICE_UUID = "0000fff0-0000-1000-8000-00805f9b34fb";
+    const BLE_OTA_CTRL_UUID    = "0000fff1-0000-1000-8000-00805f9b34fb";
+    const BLE_OTA_DATA_UUID    = "0000fff2-0000-1000-8000-00805f9b34fb";
+    const BLE_OTA_STAT_UUID    = "0000fff3-0000-1000-8000-00805f9b34fb";
 
     let bluetoothDevice = null;
 
@@ -342,7 +366,7 @@
             { namePrefix: "FAKE_POD" },
             { namePrefix: "N7" }
           ],
-          optionalServices: [BLE_SERVICE_UUID]
+          optionalServices: [BLE_SERVICE_UUID, BLE_OTA_SERVICE_UUID]
         });
 
         log(`已选中设备: [${bluetoothDevice.name}], 准备建立连接...`, "info");
@@ -399,6 +423,106 @@
       dot.classList.remove('connected');
       statusText.innerText = "连接已断开 (就绪)";
       log("蓝牙连接已正常关闭，播放器已在后台以内部 RTC 持续走时。", "info");
+    }
+
+    /* ============================================================
+     * BLE OTA 固件升级
+     * 控制 0xFFF1: 0x01+uint32LE 总长=开始 / 0x02=结束并重启 / 0x03=中止
+     * 数据 0xFFF2: WriteWithoutResponse 分块
+     * 状态 0xFFF3: [0]状态(0空闲/2写入/3完成/4错误) + [1..4]已写字节数 LE
+     * ============================================================ */
+    async function startOta() {
+      const fi = document.getElementById('fwFile');
+      const btn = document.getElementById('btnOta');
+      const bar = document.getElementById('otaBar');
+      const pctEl = document.getElementById('otaPct');
+
+      if (!navigator.bluetooth) {
+        log("当前环境不支持 Web Bluetooth（需 HTTPS + 蓝牙浏览器）", "error");
+        return;
+      }
+      if (!fi.files.length) {
+        log("请先选择固件 .bin 文件", "error");
+        return;
+      }
+      const file = fi.files[0];
+
+      try {
+        btn.disabled = true;
+        log(`固件: ${file.name}，${(file.size/1048576).toFixed(2)} MB`, "info");
+        pctEl.innerText = "连接设备…";
+
+        const dev = await navigator.bluetooth.requestDevice({
+          filters: [{ namePrefix: "FAKE_POD" }, { namePrefix: "N7" }],
+          optionalServices: [BLE_SERVICE_UUID, BLE_OTA_SERVICE_UUID]
+        });
+        bluetoothDevice = dev;
+        dev.addEventListener('gattserverdisconnected', () => {
+          log("蓝牙已断开（升级完成重启或传输中断）", "warn");
+        });
+
+        const server = await dev.gatt.connect();
+        const svc = await server.getPrimaryService(BLE_OTA_SERVICE_UUID);
+        const ctrl = await svc.getCharacteristic(BLE_OTA_CTRL_UUID);
+        const dataCh = await svc.getCharacteristic(BLE_OTA_DATA_UUID);
+        const stat = await svc.getCharacteristic(BLE_OTA_STAT_UUID);
+        log("已连接，正在发送开始命令…", "info");
+
+        const begin = new Uint8Array(5);
+        begin[0] = 0x01;
+        new DataView(begin.buffer).setUint32(1, file.size, true);
+        await ctrl.writeValue(begin);
+
+        let chunk = 180;          /* 先按较大 MTU 传，失败自动降到 20 */
+        let offset = 0;
+        let lastPct = -1;
+        while (offset < file.size) {
+          const slice = file.slice(offset, offset + chunk);
+          const buf = await slice.arrayBuffer();
+          let ok = false;
+          if (dataCh.writeValueWithoutResponse) {
+            try { await dataCh.writeValueWithoutResponse(buf); ok = true; }
+            catch (e) { ok = false; }
+          }
+          if (!ok) {
+            try { await dataCh.writeValue(buf); ok = true; }
+            catch (e) { ok = false; }
+          }
+          if (!ok) {
+            if (chunk > 20) { chunk = 20; log("切换为 20 字节小包继续…", "warn"); continue; }
+            throw new Error("写入失败 @ " + offset);
+          }
+          offset += buf.byteLength;
+          const p = Math.floor(offset * 100 / file.size);
+          if (p !== lastPct) {
+            lastPct = p;
+            bar.style.width = p + '%';
+            pctEl.innerText = `${p}%  (${(offset/1024).toFixed(0)} / ${(file.size/1024).toFixed(0)} KB)`;
+          }
+          if ((offset % (chunk * 40)) < chunk) await new Promise(r => setTimeout(r, 1));
+        }
+
+        bar.style.width = '100%';
+        pctEl.innerText = '传输完成，等待设备校验…';
+        log("数据发送完成，发送结束命令…", "success");
+        await ctrl.writeValue(new Uint8Array([0x02]));
+
+        await new Promise(r => setTimeout(r, 1200));
+        try {
+          const s = await stat.readValue();
+          const st = s.getUint8(0);
+          const wr = s.getUint32(1, true);
+          log(`状态=${st}（0空闲/2写入/3完成/4错误），已写入 ${wr} 字节`, st === 3 ? "success" : "warn");
+        } catch (e) { /* 设备可能已重启 */ }
+
+        log("🎉 升级完成，设备将自动重启。可重新连接查看版本。", "success");
+        pctEl.innerText = "完成";
+      } catch (err) {
+        log("升级失败: " + err.message, "error");
+        pctEl.innerText = "失败: " + err.message;
+      } finally {
+        btn.disabled = false;
+      }
     }
   </script>
 </body>

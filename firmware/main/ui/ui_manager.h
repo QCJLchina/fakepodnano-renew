@@ -21,7 +21,10 @@ extern "C" {
 typedef enum {
     UI_VIEW_PLAYER = 0,
     UI_VIEW_UAC,
+    UI_VIEW_FILES,       /* 音乐目录（TF 卡浏览） */
     UI_VIEW_SETTINGS,
+    UI_VIEW_USB_MODE,    /* USB 模式选择（DAC / U盘） */
+    UI_VIEW_HOME,        /* 桌面主页（2x2 宫格），开机默认 */
 } ui_view_type_t;
 
 /**
@@ -41,6 +44,22 @@ void ui_switch_view(ui_view_type_t view);
  */
 bool ui_lock(uint32_t timeout_ms);
 void ui_unlock(void);
+
+/**
+ * @brief 触摸是否初始化成功（便于无串口时在界面上显示状态）
+ */
+bool ui_touch_ok(void);
+
+/* 背光亮度 0~100 */
+void ui_set_backlight_pct(int pct);
+int  ui_get_backlight_pct(void);
+
+/* 自动息屏秒数，0=永不 */
+void ui_set_auto_off_sec(int sec);
+int  ui_get_auto_off_sec(void);
+
+/* 当前前台页面 */
+ui_view_type_t ui_get_current_view(void);
 
 #ifdef __cplusplus
 }

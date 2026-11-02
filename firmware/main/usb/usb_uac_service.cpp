@@ -17,6 +17,8 @@ static const char *TAG = "USB_UAC";
 static uint32_t s_uac_current_sample_rate = CONFIG_UAC_SAMPLE_RATE;
 static bool s_uac_streaming = false;
 static bool s_uac_held = false;
+static bool s_started = false;
+static volatile uint64_t s_rx_bytes = 0;
 
 static void uac_apply_rate(uint32_t sample_rate)
 {
@@ -48,8 +50,17 @@ static esp_err_t uac_spk_output_cb(uint8_t *buf, size_t len, void *cb_ctx)
     }
 
     s_uac_streaming = true;
+    s_rx_bytes += len;
     size_t bytes_written = 0;
-    return audio_pipeline_write(buf, len, &bytes_written, 20);
+    esp_err_t wr = audio_pipeline_write(buf, len, &bytes_written, 20);
+    static bool s_logged_first = false;
+    if (!s_logged_first) {
+        s_logged_first = true;
+        ESP_LOGI(TAG, "收到首包音频: %u 字节 @ %lu Hz / %d bit，写入 %u 字节 (ret=%s)",
+                 (unsigned)len, (unsigned long)s_uac_current_sample_rate,
+                 CONFIG_UAC_BIT_RESOLUTION, (unsigned)bytes_written, esp_err_to_name(wr));
+    }
+    return wr;
 }
 
 /* ---------------------------------------------------------------
@@ -98,6 +109,10 @@ static void uac_sample_rate_changed_cb(uint32_t new_sample_rate, void *cb_ctx)
  * --------------------------------------------------------------- */
 esp_err_t usb_uac_service_start(void)
 {
+    if (s_started) {
+        ESP_LOGI(TAG, "USB 声卡已在运行，忽略重复启动");
+        return ESP_OK;
+    }
     ESP_LOGI(TAG, "正在启动 USB 高保真多采样率声卡服务...");
 
     uac_device_config_t cfg = {};
@@ -116,6 +131,12 @@ esp_err_t usb_uac_service_start(void)
     }
 
     ESP_LOGI(TAG, "USB UAC 声卡已就绪：44.1/48/88.2/96 kHz，%d-bit 立体声", CONFIG_UAC_BIT_RESOLUTION);
+
+    /* 启动即给一个可闻的默认硬件音量并解除静音，避免完全依赖电脑下发 */
+    audio_pipeline_set_volume(80);
+    audio_pipeline_set_mute(false);
+    ESP_LOGI(TAG, "默认硬件音量已设置为 80%% 并解除静音");
+    s_started = true;
     return ESP_OK;
 }
 
@@ -132,6 +153,16 @@ esp_err_t usb_uac_service_stop(void)
 bool usb_uac_is_streaming(void)
 {
     return s_uac_streaming;
+}
+
+bool usb_uac_service_is_started(void)
+{
+    return s_started;
+}
+
+uint64_t usb_uac_get_rx_bytes(void)
+{
+    return s_rx_bytes;
 }
 
 uint32_t usb_uac_get_current_sample_rate(void)

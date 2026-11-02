@@ -61,6 +61,12 @@ esp_err_t player_resume(void);
 esp_err_t player_stop(void);
 
 /**
+ * @brief 播放当前曲目所在目录的下一首 / 上一首（到末尾循环）
+ */
+esp_err_t player_next(void);
+esp_err_t player_prev(void);
+
+/**
  * @brief 跳转到目标秒数
  */
 esp_err_t player_seek(uint32_t sec);

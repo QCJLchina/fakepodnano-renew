@@ -17,6 +17,11 @@
 static const char *TAG = "CS43131";
 
 static i2c_master_dev_handle_t s_i2c_dev = NULL;
+static i2c_master_bus_handle_t s_bus = NULL;
+
+/* I2C 事务重试次数与间隔：与触摸共用一条总线，偶发 "bus busy" 时重试即可恢复 */
+#define I2C_RETRY_COUNT   3
+#define I2C_RETRY_DELAY_MS 5
 
 /* ---------------------------------------------------------------
  * 硬件复位引脚操作
@@ -34,12 +39,21 @@ esp_err_t cs43131_hw_reset(void)
     /* 拉低复位 */
     gpio_set_level((gpio_num_t)AUDIO_DAC_RST_PIN, 0);
     vTaskDelay(pdMS_TO_TICKS(15));
-    /* 拉高启动 */
+    /* 拉高启动；CS43131 复位释放后需要一段时间（内部上电/振荡器稳定）才响应 I2C，
+     * 这里给足 50ms，避免刚释放就读 ID 读到全 0。 */
     gpio_set_level((gpio_num_t)AUDIO_DAC_RST_PIN, 1);
-    vTaskDelay(pdMS_TO_TICKS(20));
+    vTaskDelay(pdMS_TO_TICKS(50));
 
     ESP_LOGI(TAG, "硬件复位引脚 GPIO %d 已释放并就绪", AUDIO_DAC_RST_PIN);
     return ESP_OK;
+}
+
+/* ---------------------------------------------------------------
+ * 让音量/静音等接口复用外部（v2 初始化）建立的 I2C 设备句柄
+ * --------------------------------------------------------------- */
+void cs43131_set_i2c_dev_handle(i2c_master_dev_handle_t dev)
+{
+    s_i2c_dev = dev;
 }
 
 /* ---------------------------------------------------------------
@@ -57,10 +71,15 @@ static esp_err_t write_reg(uint32_t addr, uint8_t dat)
     buf[3] = 0x01;  /* 控制字节，固定 0x01 */
     buf[4] = dat;
 
-    esp_err_t ret = i2c_master_transmit(s_i2c_dev, buf, sizeof(buf), 100);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "写寄存器 0x%06lX 失败: %s", (unsigned long)addr, esp_err_to_name(ret));
+    esp_err_t ret = ESP_FAIL;
+    for (int i = 0; i < I2C_RETRY_COUNT; i++) {
+        ret = i2c_master_transmit(s_i2c_dev, buf, sizeof(buf), 100);
+        if (ret == ESP_OK) return ESP_OK;
+        ESP_LOGW(TAG, "写 0x%06lX 第 %d 次失败: %s", (unsigned long)addr, i + 1, esp_err_to_name(ret));
+        if (s_bus) i2c_master_bus_reset(s_bus);   /* 总线被拉死时做恢复 */
+        vTaskDelay(pdMS_TO_TICKS(I2C_RETRY_DELAY_MS));
     }
+    ESP_LOGE(TAG, "写寄存器 0x%06lX 最终失败: %s", (unsigned long)addr, esp_err_to_name(ret));
     return ret;
 }
 
@@ -74,10 +93,15 @@ static esp_err_t read_reg(uint32_t addr, uint8_t *dst)
     write_buf[2] = addr & 0xFF;
     write_buf[3] = 0x01;  /* 控制字节，固定 0x01 */
 
-    esp_err_t ret = i2c_master_transmit_receive(s_i2c_dev, write_buf, sizeof(write_buf), dst, 1, 100);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "读寄存器 0x%06lX 失败: %s", (unsigned long)addr, esp_err_to_name(ret));
+    esp_err_t ret = ESP_FAIL;
+    for (int i = 0; i < I2C_RETRY_COUNT; i++) {
+        ret = i2c_master_transmit_receive(s_i2c_dev, write_buf, sizeof(write_buf), dst, 1, 100);
+        if (ret == ESP_OK) return ESP_OK;
+        ESP_LOGW(TAG, "读 0x%06lX 第 %d 次失败: %s", (unsigned long)addr, i + 1, esp_err_to_name(ret));
+        if (s_bus) i2c_master_bus_reset(s_bus);
+        vTaskDelay(pdMS_TO_TICKS(I2C_RETRY_DELAY_MS));
     }
+    ESP_LOGE(TAG, "读寄存器 0x%06lX 最终失败: %s", (unsigned long)addr, esp_err_to_name(ret));
     return ret;
 }
 
@@ -86,11 +110,12 @@ static esp_err_t read_reg(uint32_t addr, uint8_t *dst)
  * --------------------------------------------------------------- */
 esp_err_t cs43131_read_chip_id(i2c_master_bus_handle_t i2c_bus, uint8_t *id)
 {
+    s_bus = i2c_bus;
     if (!s_i2c_dev) {
         i2c_device_config_t dev_cfg = {};
         dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
         dev_cfg.device_address = CS43131_I2C_ADDR;
-        dev_cfg.scl_speed_hz = TOUCH_I2C_CLK_HZ;
+        dev_cfg.scl_speed_hz = 100 * 1000;   /* 降低速率留裕量，控制写不追求带宽 */
         esp_err_t ret = i2c_master_bus_add_device(i2c_bus, &dev_cfg, &s_i2c_dev);
         if (ret != ESP_OK) return ret;
     }
@@ -127,7 +152,12 @@ esp_err_t cs43131_set_volume(i2c_master_bus_handle_t i2c_bus, uint8_t vol_percen
 
     write_reg(0x090001, reg_val);
     write_reg(0x090002, reg_val);
-    ESP_LOGD(TAG, "设置硬件音量: %d%% (寄存器值: 0x%02X)", vol_percent, reg_val);
+
+    /* 读回校验：确认写入真的生效 */
+    uint8_t rb1 = 0xAA, rb2 = 0xAA;
+    read_reg(0x090001, &rb1);
+    read_reg(0x090002, &rb2);
+    ESP_LOGI(TAG, "硬件音量 %d%% -> 写 0x%02X，读回 [0x%02X 0x%02X]", vol_percent, reg_val, rb1, rb2);
     return ESP_OK;
 }
 
@@ -210,11 +240,12 @@ esp_err_t cs43131_init(i2c_master_bus_handle_t i2c_bus)
     cs43131_hw_reset();
 
     /* 2. 添加 I2C 设备句柄 */
+    s_bus = i2c_bus;
     if (!s_i2c_dev) {
         i2c_device_config_t dev_cfg = {};
         dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
         dev_cfg.device_address = CS43131_I2C_ADDR;
-        dev_cfg.scl_speed_hz = TOUCH_I2C_CLK_HZ;
+        dev_cfg.scl_speed_hz = 100 * 1000;   /* 降低速率留裕量，控制写不追求带宽 */
         ESP_ERROR_CHECK(i2c_master_bus_add_device(i2c_bus, &dev_cfg, &s_i2c_dev));
     }
 
@@ -279,6 +310,19 @@ esp_err_t cs43131_init(i2c_master_bus_handle_t i2c_bus)
 
     /* 11. 取消静音 */
     cs43131_set_mute(i2c_bus, false);
+
+    /* 12. 回读关键寄存器，确认写入是否真的落到芯片里 */
+    {
+        uint8_t pwr = 0, hp = 0, hv = 0, mute = 0, vol = 0, clk = 0;
+        read_reg(0x020000, &pwr);
+        read_reg(0x080000, &hp);
+        read_reg(0x0B0000, &hv);
+        read_reg(0x090003, &mute);
+        read_reg(0x090001, &vol);
+        read_reg(0x010000, &clk);
+        ESP_LOGI(TAG, "回读诊断: PWR=0x%02X HP=0x%02X HV=0x%02X MUTE=0x%02X VOL=0x%02X CLK=0x%02X",
+                 pwr, hp, hv, mute, vol, clk);
+    }
 
     ESP_LOGI(TAG, "CS43131 初始化完成，耳放与 PCM 通道已就绪！");
     return ESP_OK;

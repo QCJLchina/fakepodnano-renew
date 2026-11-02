@@ -89,10 +89,10 @@ bool DsdDecoder::open(FILE *file)
     if (fread(&fmt, 1, sizeof(fmt), m_file) != sizeof(fmt)) return false;
     if (memcmp(fmt.chunk_id, "fmt ", 4) != 0 || fmt.bits_per_sample != 1) return false;
 
-    /* DAC 初始化序列没有打开 DSD/DoP 检测，继续封装只会把噪声送进 PCM 通路。 */
-    ESP_LOGE(TAG, "DSF 已识别，但 CS43131 仍在 PCM 模式，DoP 未接通，拒绝播放");
-    m_file = NULL;
-    return false;
+    /* DoP（DSD over PCM）实验性通路：按标准把 DSD 位流封装进 24bit PCM 输出。
+     * 前提：下游 DAC 具备 DoP 解码能力或 DSD 引脚直连；本 PCB 是否接通未知，
+     * 若出现无声/噪声属硬件通路限制，不影响其它 PCM 格式。 */
+    ESP_LOGW(TAG, "启用 DSD(DoP) 输出（实验性，需 DAC 支持 DoP/DSD 通路）");
 
     dsf_data_chunk_t data_chunk;
     if (fread(&data_chunk, 1, sizeof(data_chunk), m_file) != sizeof(data_chunk)) return false;

@@ -22,3 +22,6 @@ __pycache__/
 
 # Logs
 *.log
+
+# Local reverse-engineering materials (firmware dumps, APK, wheels, scripts)
+_incoming/

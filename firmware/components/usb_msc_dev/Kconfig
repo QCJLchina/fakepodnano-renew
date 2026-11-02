@@ -1,0 +1,10 @@
+menu "FAKEPOD USB MSD"
+
+    config FAKEPOD_USB_MSC_MODE
+        bool "编译为 U盘(MSC) 模式固件"
+        default n
+        help
+            开启后，本固件启动即初始化为纯 USB Mass Storage 设备（把 TF 卡暴露为 U 盘），
+            不再启动 UAC 声卡。此选项与 UAC 声卡互斥，需单独编译一份固件。
+
+endmenu

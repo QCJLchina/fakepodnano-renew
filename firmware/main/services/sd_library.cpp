@@ -32,7 +32,8 @@ static bool ends_with(const char *name, const char *suffix)
 static bool playable(const char *name)
 {
     return ends_with(name, ".wav") || ends_with(name, ".flac") ||
-           ends_with(name, ".mp3") || ends_with(name, ".aac");
+           ends_with(name, ".mp3") || ends_with(name, ".aac") || ends_with(name, ".m4a") ||
+           ends_with(name, ".dsf") || ends_with(name, ".dsd");
 }
 
 esp_err_t sd_library_mount(void)

@@ -12,6 +12,7 @@ FAKE_POD_NANO（ESP32-S3）固件重写与配套工程：扩展本地解码格�
 | `prototype/` | 原型与实验 |
 | `CONFIG_TABLE.md` / `PINS_CONFIRMED.md` | 配置与引脚文档 |
 | `REWRITE_PLAN.md` / `UI_DESIGN_SPEC.md` | 重写方案与 UI 规范 |
+| `IMPLEMENTATION_STATUS.md` | **当前实现状态、使用说明与已知限制（先读这个）** |
 
 ## 环境
 
