@@ -1,7 +1,7 @@
 # fakepodnano-renew
 
 FAKE_POD_NANO（ESP32-S3）固件重写与配套工程：扩展本地解码格式、提升 USB Audio Class 采样率/位深能力，并重做 LVGL UI。
-
+目前音频路线还需要重新探测，预计最后还是需要用src实现
 ## 目录
 
 | 路径 | 说明 |
