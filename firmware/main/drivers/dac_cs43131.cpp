@@ -1,8 +1,24 @@
 /**
- * FAKE_POD_NANO CS43131 DAC 驱动实现
+ * FAKE_POD_NANO CS43131 DAC 驱动（唯一实现）
  * ============================================
- * 基于 CS43131 官方寄存器协议与开源初始化时序
- * 接口：I2C 地址 0x30，24 位寄存器地址 + 0x01 控制字节
+ * 参考实机验证过的时序（a505283042/FakePod_Custom, src/drivers/audio/cs43131.cpp）。
+ *
+ * 硬件：I2S BCK=GPIO40 WS=GPIO38 DOUT=GPIO39（无 MCLK），RST=GPIO41，I2C=0x30~0x33。
+ * 链路：ESP32-S3 作 I2S 主机输出 32bit 槽 → CS43131 作 ASP 从机 → 耳放 → 3.5mm。
+ *
+ * 两条使用路径：
+ *   cs43131_init()           开机一次性：硬件复位 + 探测地址 + 校验 DevId（不开耳放）
+ *   cs43131_start_playback() 首次播放/切换采样率：晶振起振 → 32bit ASP → 耳放上电
+ *
+ * 关键约束（都是实测结论，改动前务必理解）：
+ *   1. I2C 控制字节必须是 0x00（8 位访问、地址不自增），不是 0x01
+ *   2. 晶振偏置 CRYSTAL_SETTING = 0x06（板载 24.576MHz，7.5uA）
+ *   3. 必须先开晶振并等到 INT_STATUS1 bit4=XTAL_READY，再切 SYS_CLOCKING=0x00；
+ *      顺序颠倒会让 DAC 数字部分失去时钟、I2C 从机随即失联
+ *   4. ASP 固定 32bit 槽：SAMPLE_BITS=0x04、CH1=0x07、CH2=0x0F、LCPR=0x3F；
+ *      与 ESP32 I2S 的 32bit 槽必须一致，否则只有底噪没有声音
+ *   5. PCM_PATH_CTL_1(0x090003)：静音 0xEF、解除 0xEC（软斜坡位在 0xE0 上，
+ *      写 0x00/0x03 会破坏软斜坡配置）
  */
 
 #include "dac_cs43131.h"
@@ -16,314 +32,340 @@
 
 static const char *TAG = "CS43131";
 
-static i2c_master_dev_handle_t s_i2c_dev = NULL;
-static i2c_master_bus_handle_t s_bus = NULL;
+/* ---------------- 寄存器地址（24 位 MAP） ---------------- */
+#define REG_DEVICE_ID_AB        0x010000
+#define REG_DEVICE_ID_CD        0x010001
+#define REG_DEVICE_ID_E         0x010002
+#define REG_REVISION_ID         0x010004
+#define REG_SUBREVISION_ID      0x010005
+#define REG_SYSTEM_CLOCKING     0x010006
+#define REG_ASP_SAMPLE_RATE     0x01000B
+#define REG_ASP_SAMPLE_BITS     0x01000C
+#define REG_POP_FREE_UP_1       0x010010
+#define REG_POWER_DOWN          0x020000
+#define REG_CRYSTAL_SETTING     0x020052
+#define REG_ASP_N_LSB           0x040010
+#define REG_ASP_N_MSB           0x040011
+#define REG_ASP_M_LSB           0x040012
+#define REG_ASP_M_MSB           0x040013
+#define REG_ASP_LCHI_LSB        0x040014
+#define REG_ASP_LCHI_MSB        0x040015
+#define REG_ASP_LCPR_LSB        0x040016
+#define REG_ASP_LCPR_MSB        0x040017
+#define REG_ASP_CLOCK_CONFIG    0x040018
+#define REG_ASP_FRAME_CONFIG    0x040019
+#define REG_ASP_CH1_LOCATION    0x050000
+#define REG_ASP_CH2_LOCATION    0x050001
+#define REG_ASP_CH1_SIZE_EN     0x05000A
+#define REG_ASP_CH2_SIZE_EN     0x05000B
+#define REG_HP_OUTPUT_CONTROL   0x080000
+#define REG_POP_FREE_UP_2       0x080032
+#define REG_PCM_FILTER_OPTION   0x090000
+#define REG_PCM_VOLUME_B        0x090001
+#define REG_PCM_VOLUME_A        0x090002
+#define REG_PCM_PATH_CTL_1      0x090003
+#define REG_PCM_PATH_CTL_2      0x090004
+#define REG_CLASS_H_CONTROL     0x0B0000
+#define REG_INT_STATUS_1        0x0F0000
+#define REG_INT_MASK_1          0x0F0010
 
-/* I2C 事务重试次数与间隔：与触摸共用一条总线，偶发 "bus busy" 时重试即可恢复 */
-#define I2C_RETRY_COUNT   3
-#define I2C_RETRY_DELAY_MS 5
+/* PCM 通路软斜坡：静音/解除静音的唯一合法取值（见文件头约束 5） */
+#define PCM_PATH_MUTED          0xEF
+#define PCM_PATH_UNMUTED        0xEC
+
+/* 普通耳机安全档：0.5 Vrms（原厂兜底档，高阻/线路输出需另配） */
+#define HP_CLASS_H_NORMAL       0x1C
+#define HP_OUTPUT_NORMAL        0x00
+
+#define HP_PDN_DONE_WAIT_MS     100
+
+/* ---------------- 唯一 I2C 设备句柄 ---------------- */
+static i2c_master_dev_handle_t s_dev = NULL;
+static bool s_ready = false;              /* 控制口已验证 */
 
 /* ---------------------------------------------------------------
- * 硬件复位引脚操作
+ * 寄存器读写（控制字节 0x00）
  * --------------------------------------------------------------- */
-esp_err_t cs43131_hw_reset(void)
+static esp_err_t write_reg(uint32_t addr, uint8_t val)
 {
-    gpio_config_t io_conf = {};
-    io_conf.pin_bit_mask = (1ULL << AUDIO_DAC_RST_PIN);
-    io_conf.mode = GPIO_MODE_OUTPUT;
-    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    io_conf.intr_type = GPIO_INTR_DISABLE;
-    gpio_config(&io_conf);
+    if (!s_dev) return ESP_ERR_INVALID_STATE;
+    uint8_t buf[5] = {
+        (uint8_t)((addr >> 16) & 0xFF),
+        (uint8_t)((addr >> 8) & 0xFF),
+        (uint8_t)(addr & 0xFF),
+        0x00,
+        val
+    };
+    for (int i = 0; i < 3; i++) {
+        if (i2c_master_transmit(s_dev, buf, sizeof(buf), 100) == ESP_OK) return ESP_OK;
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    ESP_LOGW(TAG, "写 0x%06lX=0x%02X 失败", (unsigned long)addr, val);
+    return ESP_FAIL;
+}
 
-    /* 拉低复位 */
+static esp_err_t read_reg(uint32_t addr, uint8_t *out)
+{
+    if (!s_dev || !out) return ESP_ERR_INVALID_ARG;
+    uint8_t pre[4] = {
+        (uint8_t)((addr >> 16) & 0xFF),
+        (uint8_t)((addr >> 8) & 0xFF),
+        (uint8_t)(addr & 0xFF),
+        0x00
+    };
+    for (int i = 0; i < 3; i++) {
+        if (i2c_master_transmit(s_dev, pre, sizeof(pre), 100) == ESP_OK &&
+            i2c_master_receive(s_dev, out, 1, 100) == ESP_OK) {
+            return ESP_OK;
+        }
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    *out = 0;
+    return ESP_FAIL;
+}
+
+/* ---------------------------------------------------------------
+ * 采样率 → ASP_SPRATE（与原厂 FakePod Rate Profile 一致）
+ * 注意：44.1k 与 48k 同为 2 是原厂档位定义，不是笔误。
+ * --------------------------------------------------------------- */
+static bool rate_to_sprate(uint32_t sr, uint8_t *out)
+{
+    switch (sr) {
+        case 32000:  *out = 0; return true;
+        case 44100:  *out = 2; return true;
+        case 48000:  *out = 2; return true;
+        case 88200:  *out = 3; return true;
+        case 96000:  *out = 4; return true;
+        case 176400: *out = 5; return true;
+        case 192000: *out = 6; return true;
+        default:     return false;
+    }
+}
+
+/* ---------------------------------------------------------------
+ * 硬件复位 + 控制口验证
+ * --------------------------------------------------------------- */
+static esp_err_t dac_hw_reset(void)
+{
+    gpio_config_t cfg = {};
+    cfg.pin_bit_mask = (1ULL << AUDIO_DAC_RST_PIN);
+    cfg.mode = GPIO_MODE_OUTPUT;
+    cfg.pull_up_en = GPIO_PULLUP_DISABLE;
+    cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    cfg.intr_type = GPIO_INTR_DISABLE;
+    esp_err_t ret = gpio_config(&cfg);
+    if (ret != ESP_OK) return ret;
+
+    /* RESET 低有效；100Hz tick 下 2ms/3ms 会被截断成 0 tick，用 tick 兜底 */
     gpio_set_level((gpio_num_t)AUDIO_DAC_RST_PIN, 0);
-    vTaskDelay(pdMS_TO_TICKS(15));
-    /* 拉高启动；CS43131 复位释放后需要一段时间（内部上电/振荡器稳定）才响应 I2C，
-     * 这里给足 50ms，避免刚释放就读 ID 读到全 0。 */
+    vTaskDelay(pdMS_TO_TICKS(3) ? pdMS_TO_TICKS(3) : 1);
     gpio_set_level((gpio_num_t)AUDIO_DAC_RST_PIN, 1);
-    vTaskDelay(pdMS_TO_TICKS(50));
-
-    ESP_LOGI(TAG, "硬件复位引脚 GPIO %d 已释放并就绪", AUDIO_DAC_RST_PIN);
+    vTaskDelay(pdMS_TO_TICKS(4) ? pdMS_TO_TICKS(4) : 1);
     return ESP_OK;
 }
 
-/* ---------------------------------------------------------------
- * 让音量/静音等接口复用外部（v2 初始化）建立的 I2C 设备句柄
- * --------------------------------------------------------------- */
-void cs43131_set_i2c_dev_handle(i2c_master_dev_handle_t dev)
+/* ADR 电阻决定地址低两位，复位后探测真实响应地址（0x30~0x33） */
+static esp_err_t probe_device(i2c_master_bus_handle_t bus)
 {
-    s_i2c_dev = dev;
-}
-
-/* ---------------------------------------------------------------
- * CS43131 特殊的 I2C 读写时序
- * 24 位地址 + 1 字节控制字节(0x01) + 数据
- * --------------------------------------------------------------- */
-static esp_err_t write_reg(uint32_t addr, uint8_t dat)
-{
-    if (!s_i2c_dev) return ESP_ERR_INVALID_STATE;
-
-    uint8_t buf[5];
-    buf[0] = (addr >> 16) & 0xFF;
-    buf[1] = (addr >> 8) & 0xFF;
-    buf[2] = addr & 0xFF;
-    buf[3] = 0x00;  /* 原厂写帧第 4 字节为 0x00（不是 0x01），见 OTA 反汇编 0x4201c080 */
-    buf[4] = dat;
-
-    esp_err_t ret = ESP_FAIL;
-    for (int i = 0; i < I2C_RETRY_COUNT; i++) {
-        ret = i2c_master_transmit(s_i2c_dev, buf, sizeof(buf), 100);
-        if (ret == ESP_OK) return ESP_OK;
-        ESP_LOGW(TAG, "写 0x%06lX 第 %d 次失败: %s", (unsigned long)addr, i + 1, esp_err_to_name(ret));
-        if (s_bus) i2c_master_bus_reset(s_bus);   /* 总线被拉死时做恢复 */
-        vTaskDelay(pdMS_TO_TICKS(I2C_RETRY_DELAY_MS));
-    }
-    ESP_LOGE(TAG, "写寄存器 0x%06lX 最终失败: %s", (unsigned long)addr, esp_err_to_name(ret));
-    return ret;
-}
-
-static esp_err_t read_reg(uint32_t addr, uint8_t *dst)
-{
-    if (!s_i2c_dev || !dst) return ESP_ERR_INVALID_ARG;
-
-    uint8_t write_buf[4];
-    write_buf[0] = (addr >> 16) & 0xFF;
-    write_buf[1] = (addr >> 8) & 0xFF;
-    write_buf[2] = addr & 0xFF;
-    write_buf[3] = 0x00;  /* 原厂读帧第 4 字节为 0x00 */
-
-    esp_err_t ret = ESP_FAIL;
-    for (int i = 0; i < I2C_RETRY_COUNT; i++) {
-        ret = i2c_master_transmit_receive(s_i2c_dev, write_buf, sizeof(write_buf), dst, 1, 100);
-        if (ret == ESP_OK) return ESP_OK;
-        ESP_LOGW(TAG, "读 0x%06lX 第 %d 次失败: %s", (unsigned long)addr, i + 1, esp_err_to_name(ret));
-        if (s_bus) i2c_master_bus_reset(s_bus);
-        vTaskDelay(pdMS_TO_TICKS(I2C_RETRY_DELAY_MS));
-    }
-    ESP_LOGE(TAG, "读寄存器 0x%06lX 最终失败: %s", (unsigned long)addr, esp_err_to_name(ret));
-    return ret;
-}
-
-/* ---------------------------------------------------------------
- * 读取芯片 ID
- * --------------------------------------------------------------- */
-esp_err_t cs43131_read_chip_id(i2c_master_bus_handle_t i2c_bus, uint8_t *id)
-{
-    s_bus = i2c_bus;
-    if (!s_i2c_dev) {
+    for (uint8_t a = 0x30; a <= 0x33; a++) {
         i2c_device_config_t dev_cfg = {};
         dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
-        dev_cfg.device_address = CS43131_I2C_ADDR;
-        dev_cfg.scl_speed_hz = 100 * 1000;   /* 降低速率留裕量，控制写不追求带宽 */
-        esp_err_t ret = i2c_master_bus_add_device(i2c_bus, &dev_cfg, &s_i2c_dev);
-        if (ret != ESP_OK) return ret;
+        dev_cfg.device_address = a;
+        dev_cfg.scl_speed_hz = 100 * 1000;
+        i2c_master_dev_handle_t dev = NULL;
+        if (i2c_master_bus_add_device(bus, &dev_cfg, &dev) != ESP_OK) continue;
+
+        s_dev = dev;
+        uint8_t id_ab = 0, id_cd = 0, id_e = 0;
+        bool ok = (read_reg(REG_DEVICE_ID_AB, &id_ab) == ESP_OK &&
+                   read_reg(REG_DEVICE_ID_CD, &id_cd) == ESP_OK &&
+                   read_reg(REG_DEVICE_ID_E, &id_e) == ESP_OK &&
+                   id_ab == 0x43 && id_cd == 0x13 && id_e == 0x10);
+        if (ok) {
+            ESP_LOGI(TAG, "发现 CS43131 @0x%02X（DevId 43 13 10）", a);
+            return ESP_OK;
+        }
+        i2c_master_bus_rm_device(dev);
+        s_dev = NULL;
     }
-
-    uint8_t b1 = 0, b2 = 0, b3 = 0, rev = 0;
-    read_reg(0x000001, &b1);
-    read_reg(0x000002, &b2);
-    read_reg(0x000003, &b3);
-    read_reg(0x000000, &rev);
-
-    ESP_LOGI(TAG, "CS43131 芯片 ID: [0x%02X 0x%02X 0x%02X], 硬件版本 Revision: 0x%02X",
-             b1, b2, b3, rev);
-
-    if (id) *id = b2;
-    return ESP_OK;
+    return ESP_ERR_NOT_FOUND;
 }
 
-/* ---------------------------------------------------------------
- * 音量设置：0 ~ 100 映射到 CS43131 硬件衰减
- * CS43131 PCM 音量寄存器 0x090001 / 0x090002：
- * 0x00 = 0dB, 0x10 = -8dB, 0x90 = -72dB, 0xFF = -127.5dB
- * --------------------------------------------------------------- */
-esp_err_t cs43131_set_volume(i2c_master_bus_handle_t i2c_bus, uint8_t vol_percent)
-{
-    if (vol_percent > 100) vol_percent = 100;
-
-    uint8_t reg_val;
-    if (vol_percent == 0) {
-        reg_val = 0xFF; /* 静音 */
-    } else {
-        /* 对数/线性平滑映射：100% -> 0x00 (0dB), 1% -> 0x90 (~ -72dB) */
-        reg_val = (uint8_t)((100 - vol_percent) * 0x90 / 100);
-    }
-
-    write_reg(0x090001, reg_val);
-    write_reg(0x090002, reg_val);
-
-    /* 读回校验：确认写入真的生效 */
-    uint8_t rb1 = 0xAA, rb2 = 0xAA;
-    read_reg(0x090001, &rb1);
-    read_reg(0x090002, &rb2);
-    ESP_LOGI(TAG, "硬件音量 %d%% -> 写 0x%02X，读回 [0x%02X 0x%02X]", vol_percent, reg_val, rb1, rb2);
-    return ESP_OK;
-}
-
-/* ---------------------------------------------------------------
- * 静音设置
- * --------------------------------------------------------------- */
-esp_err_t cs43131_set_mute(i2c_master_bus_handle_t i2c_bus, bool mute)
-{
-    uint8_t tmp = 0;
-    read_reg(0x090003, &tmp);
-    if (mute) {
-        tmp |= 0x03;
-    } else {
-        tmp &= ~0x03;
-    }
-    write_reg(0x090003, tmp);
-    ESP_LOGI(TAG, "设置静音: %s", mute ? "开" : "关");
-    return ESP_OK;
-}
-
-/* ---------------------------------------------------------------
- * 采样率设置（支持 32k ~ 384k 全阶）
- * --------------------------------------------------------------- */
-esp_err_t cs43131_set_sample_rate(i2c_master_bus_handle_t i2c_bus, uint32_t sr)
-{
-    uint8_t reg = 2; /* 默认 48k */
-    switch (sr) {
-        case 32000:  reg = 0; break;
-        case 44100:  reg = 1; break;
-        case 48000:  reg = 2; break;
-        case 88200:  reg = 3; break;
-        case 96000:  reg = 4; break;
-        case 176400: reg = 5; break;
-        case 192000: reg = 6; break;
-        case 352800: reg = 7; break;
-        case 384000: reg = 8; break;
-        default:
-            ESP_LOGW(TAG, "不支持的采样率 %lu，使用默认 48000", (unsigned long)sr);
-            reg = 2;
-            break;
-    }
-    write_reg(0x01000B, reg);
-    ESP_LOGI(TAG, "CS43131 采样率设置为: %lu Hz (模式 0x%02X)", (unsigned long)sr, reg);
-    return ESP_OK;
-}
-
-/* 设置位宽 16 / 24 / 32 bit，并让 ASP 槽宽跟着变。
- * 0x05000A 的低 2 位是槽宽：0=32，1=24，2=16，3=8。高位保留通道使能。 */
-esp_err_t cs43131_set_sample_bits(i2c_master_bus_handle_t i2c_bus, uint8_t bits)
-{
-    (void)i2c_bus;
-    uint8_t word = 0;
-    uint8_t slot = 0;
-    switch (bits) {
-        case 32: word = 0; slot = 0; break;
-        case 24: word = 1; slot = 0; break; /* 24 有效位放在 32-bit slot 高位 */
-        case 16: word = 2; slot = 2; break;
-        case 8:  word = 3; slot = 3; break;
-        default: word = 2; slot = 2; bits = 16; break;
-    }
-    write_reg(0x01000C, word);
-    uint8_t asp = 0;
-    if (read_reg(0x05000A, &asp) != ESP_OK) {
-        asp = 0x04; /* 保留原来的通道使能位 */
-    }
-    asp = (uint8_t)((asp & ~0x03) | (slot & 0x03));
-    write_reg(0x05000A, asp);
-    ESP_LOGI(TAG, "CS43131 位宽设置为: %d bit（槽宽编码 %u）", bits, slot);
-    return ESP_OK;
-}
-
-/* ---------------------------------------------------------------
- * CS43131 完整硬件启动与配置序列
- * --------------------------------------------------------------- */
 esp_err_t cs43131_init(i2c_master_bus_handle_t i2c_bus)
 {
-    ESP_LOGI(TAG, "开始 CS43131 初始化序列...");
+    if (!i2c_bus) return ESP_ERR_INVALID_ARG;
+    if (s_ready) return ESP_OK;
 
-    /* 1. 执行硬件拉低复位 */
-    cs43131_hw_reset();
-
-    /* 2. 添加 I2C 设备句柄 */
-    s_bus = i2c_bus;
-    if (!s_i2c_dev) {
-        i2c_device_config_t dev_cfg = {};
-        dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
-        dev_cfg.device_address = CS43131_I2C_ADDR;
-        dev_cfg.scl_speed_hz = 100 * 1000;   /* 降低速率留裕量，控制写不追求带宽 */
-        ESP_ERROR_CHECK(i2c_master_bus_add_device(i2c_bus, &dev_cfg, &s_i2c_dev));
+    esp_err_t ret = dac_hw_reset();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "硬件复位失败: %s", esp_err_to_name(ret));
+        return ret;
     }
 
-    /* 3. 读芯片 ID 确认通信正常 */
-    uint8_t chip_id = 0;
-    cs43131_read_chip_id(i2c_bus, &chip_id);
-
-    /* 4. 晶振与基础时钟驱动 (XTAL Driver) */
-    write_reg(0x020052, 0x02); // Crystal setting to 12.5uA
-    write_reg(0x010006, 0x06); // Internal MCLK expected 22.5792MHz | RCO Mode
-    write_reg(0x020000, 0xF6); // Power up XTAL
-
-    /* 5. PLL 锁相环初始化序列 (标准配置) */
-    write_reg(0x020000, 0xF2); // Power up XTAL | PLL
-    write_reg(0x040002, 0x03); // PLL_REF_PREDIV = 8
-    write_reg(0x030008, 0x0A); // PLL_OUT_DIV = 0x0A
-    write_reg(0x030002, 0x80); // PLL_DIV_FRAC
-    write_reg(0x030003, 0x76);
-    write_reg(0x030004, 0x79);
-    write_reg(0x030005, 0x45); // PLL_DIV_INT = 0x45
-    write_reg(0x03001B, 0x01); // PLL_MODE = 1
-    write_reg(0x03000A, 0x6F); // PLL_CAL_RATIO = 111
-    write_reg(0x030001, 0x01); // PLL_START
-
-    /* 6. 将内部数字处理核心切换到 PLL */
-    write_reg(0x010006, 0x05); // Internal MCLK -> PLL Mode
-
-    /* 7. ASP 音频串行口配置 (从机模式接收来自 ESP32 I2S 主机的数据) */
-    write_reg(0x01000D, 0x00); // ASP 时钟活跃
-    write_reg(0x040018, 0x0C); // ASP Master/Slave 协议与反相设置
-    write_reg(0x040019, 0x0A); // 50/50 占空比, 帧起始延迟
-    write_reg(0x050000, 0x00); // 通道 1 起始位置
-    write_reg(0x050001, 0x00); // 通道 2 起始位置
-    write_reg(0x05000A, 0x04); // 先只开左右通道，槽宽由下面的位宽设置覆盖
-    write_reg(0x05000B, 0x0F);
-    cs43131_set_sample_rate(i2c_bus, 48000);
-    cs43131_set_sample_bits(i2c_bus, 16);
-
-    /* 8. PCM 通路核心控制 */
-    write_reg(0x090000, 0x00); // 滤波器模式
-    cs43131_set_volume(i2c_bus, 80); // 初始音量 80%
-    write_reg(0x090003, 0x0F); // PCM 软斜坡音量过渡
-    write_reg(0x090004, 0x00); // 通路极性控制
-
-    write_reg(0x020000, 0xB0); // 电源管理：上电 ASP | XTAL | PLL
-
-    /* 9. 耳机放大器 (HP Driver) 配置 */
-    write_reg(0x080000, 0x10); // 满幅输出电压 1V RMS
-    write_reg(0x0B0000, 0x00); // 高压模式使能
-
-    /* 10. 免爆音参数 (Pop-free Sequence) */
-    write_reg(0x010010, 0x99);
-    write_reg(0x080032, 0x20);
-
-    /* 上电耳机功放 */
-    write_reg(0x020000, 0xA0); // 上电 HP | ASP | XTAL | PLL
-    vTaskDelay(pdMS_TO_TICKS(25));
-
-    /* 恢复免爆音正常状态 */
-    write_reg(0x010010, 0x00);
-    write_reg(0x080032, 0x00);
-
-    /* 11. 取消静音 */
-    cs43131_set_mute(i2c_bus, false);
-
-    /* 12. 回读关键寄存器，确认写入是否真的落到芯片里 */
-    {
-        uint8_t pwr = 0, hp = 0, hv = 0, mute = 0, vol = 0, clk = 0;
-        read_reg(0x020000, &pwr);
-        read_reg(0x080000, &hp);
-        read_reg(0x0B0000, &hv);
-        read_reg(0x090003, &mute);
-        read_reg(0x090001, &vol);
-        read_reg(0x010000, &clk);
-        ESP_LOGI(TAG, "回读诊断: PWR=0x%02X HP=0x%02X HV=0x%02X MUTE=0x%02X VOL=0x%02X CLK=0x%02X",
-                 pwr, hp, hv, mute, vol, clk);
+    if (probe_device(i2c_bus) != ESP_OK) {
+        ESP_LOGE(TAG, "0x30~0x33 无响应，请检查 RESET 引脚、DAC 供电与 ADR 连接");
+        return ESP_ERR_NOT_FOUND;
     }
 
-    ESP_LOGI(TAG, "CS43131 初始化完成，耳放与 PCM 通道已就绪！");
+    uint8_t rev = 0, sub = 0;
+    read_reg(REG_REVISION_ID, &rev);
+    read_reg(REG_SUBREVISION_ID, &sub);
+    ESP_LOGI(TAG, "控制口验证成功：Rev=0x%02X Sub=0x%02X（本阶段不开耳放）", rev, sub);
+
+    s_ready = true;
     return ESP_OK;
+}
+
+/* ---------------------------------------------------------------
+ * 播放链路：晶振 → 时钟 → ASP（幂等，可在采样率变化时重入）
+ * --------------------------------------------------------------- */
+static esp_err_t start_clock_and_asp(uint32_t sample_rate)
+{
+    uint8_t sprate = 0;
+    if (!rate_to_sprate(sample_rate, &sprate)) {
+        ESP_LOGE(TAG, "采样率不在白名单：%lu Hz", (unsigned long)sample_rate);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    /* XTAL_READY/XTAL_ERROR 是 sticky 状态：先读清，再解屏蔽 */
+    uint8_t st = 0;
+    read_reg(REG_INT_STATUS_1, &st);
+
+    if (write_reg(REG_CRYSTAL_SETTING, 0x06) != ESP_OK) return ESP_FAIL;   /* 24.576MHz / 7.5uA */
+
+    st = 0;
+    read_reg(REG_INT_STATUS_1, &st);
+    uint8_t mask = 0;
+    if (read_reg(REG_INT_MASK_1, &mask) != ESP_OK) return ESP_FAIL;
+    if (write_reg(REG_INT_MASK_1, (uint8_t)(mask & 0xE7)) != ESP_OK) return ESP_FAIL;
+
+    /* 只开晶振（复位值 0xFE 清 PDN_XTAL 后为 0xF6），耳放与 ASP 仍关闭 */
+    uint8_t power = 0;
+    if (read_reg(REG_POWER_DOWN, &power) != ESP_OK) return ESP_FAIL;
+    if (write_reg(REG_POWER_DOWN, (uint8_t)(power & 0xF6)) != ESP_OK) return ESP_FAIL;
+
+    bool ready = false;
+    uint8_t last = 0;
+    for (int i = 0; i < 20; i++) {
+        vTaskDelay(pdMS_TO_TICKS(1));
+        st = 0;
+        if (read_reg(REG_INT_STATUS_1, &st) != ESP_OK) return ESP_FAIL;
+        last = st;
+        if (st & 0x08) {
+            ESP_LOGE(TAG, "晶振启动错误：INT_STATUS1=0x%02X", st);
+            return ESP_FAIL;
+        }
+        if (st & 0x10) { ready = true; break; }
+    }
+    if (!ready) {
+        ESP_LOGE(TAG, "XTAL_READY 超时：INT_STATUS1=0x%02X", last);
+        return ESP_ERR_TIMEOUT;
+    }
+
+    /* 晶振就绪后才切 Direct MCLK（24.576MHz） */
+    if (write_reg(REG_SYSTEM_CLOCKING, 0x00) != ESP_OK) return ESP_FAIL;
+    vTaskDelay(pdMS_TO_TICKS(1));
+
+    /* ASP：固定 32bit 槽、从机模式 */
+    const struct { uint32_t reg; uint8_t val; } cfg[] = {
+        { REG_ASP_SAMPLE_RATE,  sprate },
+        { REG_ASP_SAMPLE_BITS,  0x04   },
+        { REG_ASP_N_LSB,        0x01   },
+        { REG_ASP_N_MSB,        0x00   },
+        { REG_ASP_M_LSB,        0x08   },
+        { REG_ASP_M_MSB,        0x00   },
+        { REG_ASP_LCHI_LSB,     0x1F   },
+        { REG_ASP_LCHI_MSB,     0x00   },
+        { REG_ASP_LCPR_LSB,     0x3F   },
+        { REG_ASP_LCPR_MSB,     0x00   },
+        { REG_ASP_CLOCK_CONFIG, 0x0C   },
+        { REG_ASP_FRAME_CONFIG, 0x0A   },
+        { REG_ASP_CH1_LOCATION, 0x00   },
+        { REG_ASP_CH2_LOCATION, 0x00   },
+        { REG_ASP_CH1_SIZE_EN,  0x07   },
+        { REG_ASP_CH2_SIZE_EN,  0x0F   },
+    };
+    for (size_t i = 0; i < sizeof(cfg) / sizeof(cfg[0]); i++) {
+        if (write_reg(cfg[i].reg, cfg[i].val) != ESP_OK) {
+            ESP_LOGE(TAG, "配置 ASP 0x%06lX 失败", (unsigned long)cfg[i].reg);
+            return ESP_FAIL;
+        }
+    }
+    ESP_LOGI(TAG, "ASP 就绪：%lu Hz / 32bit 槽 / 从机", (unsigned long)sample_rate);
+    return ESP_OK;
+}
+
+/* 耳放 pop-free 上电（PCM 保持静音，由调用方 release） */
+static esp_err_t power_up_headphone(void)
+{
+    const struct { uint32_t reg; uint8_t val; } cfg[] = {
+        { REG_PCM_FILTER_OPTION, 0x02   },
+        { REG_PCM_VOLUME_B,      0x28   },
+        { REG_PCM_VOLUME_A,      0x28   },
+        { REG_PCM_PATH_CTL_1,    PCM_PATH_MUTED },
+        { REG_PCM_PATH_CTL_2,    0x00   },
+        { REG_CLASS_H_CONTROL,   HP_CLASS_H_NORMAL },
+        { REG_HP_OUTPUT_CONTROL, HP_OUTPUT_NORMAL },
+        { REG_POP_FREE_UP_1,     0x99   },
+        { REG_POP_FREE_UP_2,     0x20   },
+    };
+    for (size_t i = 0; i < sizeof(cfg) / sizeof(cfg[0]); i++) {
+        if (write_reg(cfg[i].reg, cfg[i].val) != ESP_OK) return ESP_FAIL;
+    }
+
+    uint8_t power = 0;
+    if (read_reg(REG_POWER_DOWN, &power) != ESP_OK) return ESP_FAIL;
+
+    /* 先确认 ASP 开启，再解除 PDN_HP */
+    power &= (uint8_t)(~0x40);
+    if (write_reg(REG_POWER_DOWN, power) != ESP_OK) return ESP_FAIL;
+    power &= (uint8_t)(~0x10);
+    if (write_reg(REG_POWER_DOWN, power) != ESP_OK) return ESP_FAIL;
+
+    vTaskDelay(pdMS_TO_TICKS(12));
+
+    if (write_reg(REG_POP_FREE_UP_2, 0x00) != ESP_OK) return ESP_FAIL;
+    if (write_reg(REG_POP_FREE_UP_1, 0x00) != ESP_OK) return ESP_FAIL;
+
+    ESP_LOGI(TAG, "耳放上电完成（POWER_DOWN=0x%02X，PCM 仍静音）", power);
+    return ESP_OK;
+}
+
+esp_err_t cs43131_start_playback(i2c_master_bus_handle_t i2c_bus, uint32_t sample_rate)
+{
+    esp_err_t ret = cs43131_init(i2c_bus);
+    if (ret != ESP_OK) return ret;
+
+    ret = start_clock_and_asp(sample_rate);
+    if (ret != ESP_OK) return ret;
+
+    return power_up_headphone();
+}
+
+/* ---------------------------------------------------------------
+ * 音量 / 静音 / 采样率（对外仅此三个控制入口）
+ * --------------------------------------------------------------- */
+esp_err_t cs43131_set_volume(i2c_master_bus_handle_t i2c_bus, uint8_t volume)
+{
+    (void)i2c_bus;
+    if (!s_dev) return ESP_ERR_INVALID_STATE;
+    if (volume > 100) volume = 100;
+    /* 0..100 → 0..0xFF half-dB 衰减；0% 即 0xFF 完全静音 */
+    uint8_t att = (uint8_t)((100 - volume) * 0xFF / 100);
+    esp_err_t ret = write_reg(REG_PCM_VOLUME_B, att);
+    if (ret == ESP_OK) ret = write_reg(REG_PCM_VOLUME_A, att);
+    return ret;
+}
+
+esp_err_t cs43131_set_mute(i2c_master_bus_handle_t i2c_bus, bool mute)
+{
+    (void)i2c_bus;
+    if (!s_dev) return ESP_ERR_INVALID_STATE;
+    /* 唯一允许写 PCM_PATH_CTL_1 的地方：软斜坡位必须保持，只切静音位 */
+    return write_reg(REG_PCM_PATH_CTL_1, mute ? PCM_PATH_MUTED : PCM_PATH_UNMUTED);
+}
+
+esp_err_t cs43131_release_mute(void)
+{
+    return cs43131_set_mute(NULL, false);
 }

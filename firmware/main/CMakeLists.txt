@@ -6,8 +6,6 @@ set(MAIN_SRCS
          "board/board_init.cpp"
          "drivers/lcd_co5300.cpp"
          "drivers/dac_cs43131.cpp"
-         "drivers/dac_cs43131_v2.cpp"
-         "drivers/dac_cs43131_v4.cpp"
          "audio/audio_pipeline.cpp"
          "audio/decoder_base.cpp"
          "audio/decoder_wav.cpp"

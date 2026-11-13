@@ -221,7 +221,8 @@ esp_err_t lcd_init(esp_lcd_panel_handle_t *ret_panel,
      * 表现为系统还活着（IMU/心跳正常）但 UI 永久卡住。
      * 内部 RAM 不够的问题改由「LVGL 帧缓冲放内部 DMA RAM」解决（见 ui_manager.cpp），
      * 这样驱动直接 DMA、完全不做临时 bounce 分配。 */
-    io_cfg.flags.psram_dma_direct = 0;
+    /* 本工程使用标准 ESP-IDF 5.5.3，esp_lcd_panel_io_spi_config_t 没有该字段；
+     * 上游自定义分支才带 psram_dma_direct，这里等价于保持默认（关闭）。 */
 
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_SPI_HOST,
                                                  &io_cfg, &io_handle),
@@ -436,8 +437,8 @@ esp_err_t lcd_show_test_pattern(esp_lcd_panel_handle_t panel)
     }
 
     /* 分带提交：整屏一次 draw_bitmap 会被拆成 13 个 SPI 事务（每块 ≤32KB）。
-     * 现已打开 flags.psram_dma_direct，DMA 直接用 PSRAM 缓冲、不再申请内部
-     * bounce buffer；这里仍按 46 行一条带提交，和 LVGL 分带刷新保持一致。 */
+     * 标准 ESP-IDF 的 PSRAM 缓冲仍走内部 bounce buffer 拷贝，本函数按 46 行一条带
+     * 提交，和 LVGL 分带刷新保持一致。 */
     const int BAND_LINES = 46;
     esp_err_t err = ESP_OK;
     for (int y = 0; y < H && err == ESP_OK; y += BAND_LINES) {

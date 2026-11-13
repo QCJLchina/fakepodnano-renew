@@ -1,23 +1,14 @@
 /**
- * FAKE_POD_NANO CS43131 DAC 驱动
+ * FAKE_POD_NANO CS43131 DAC 驱动接口
  * ============================================
- * CS43131 是 Cirrus Logic 的高性能 DAC，支持：
- *   - PCM 最大 32bit / 384kHz
- *   - DSD64 / DSD128 / DSD256 原生解码
- *   - I2C 控制（地址 0x30）
+ * 实现见 dac_cs43131.cpp（单份实现，不要再按版本另建文件）。
  *
- * 硬件连接：
- *   I2S:  BCK=40  WS=38  DOUT=39   MCK=未接
- *   RST:  GPIO 41 (低电平复位)
- *   I2C:  地址 0x30，与触摸/IMU 共用总线 0
+ * 硬件：I2S BCK=GPIO40 WS=GPIO38 DOUT=GPIO39（无 MCLK），RST=GPIO41，I2C 0x30~0x33
  *
- * 实现策略：
- *   1. 先通过 I2C 读芯片 ID 确认通信正常
- *   2. 写初始化寄存器序列
- *   3. I2S 输出 PCM 数据
- *
- * 注意：CS43131 寄存器映射需参考官方数据手册
- *      本实现基于公开资料推导，需实测验证
+ * 使用顺序：
+ *   1. 开机：cs43131_init()            只验证控制口，不开耳放
+ *   2. 首次播放 / 切采样率：cs43131_start_playback()  晶振+ASP+耳放上电（PCM 仍静音）
+ *   3. 真正出声前：cs43131_release_mute()
  */
 
 #pragma once
@@ -31,106 +22,42 @@
 extern "C" {
 #endif
 
-/** CS43131 I2C 地址（7 位） */
+/** CS43131 I2C 地址（7 位，实际 0x30~0x33 由 ADR 决定，驱动会探测） */
 #define CS43131_I2C_ADDR    0x30
 
-/** 音频参数 */
-#define AUDIO_SAMPLE_RATE_DEFAULT   48000
-#define AUDIO_BITS_DEFAULT          16
+/** 默认音频参数 */
+#define AUDIO_SAMPLE_RATE_DEFAULT   44100
+#define AUDIO_BITS_DEFAULT          32
 #define AUDIO_CHANNELS_DEFAULT      2
 
 /**
- * @brief 初始化 CS43131 DAC
+ * @brief 输出链路的槽位宽（bit）。
  *
- * @param i2c_bus  已初始化的 I2C 总线句柄（来自 board_i2c_bus_get()）
- * @return ESP_OK 成功
+ * 这是「I2S 槽宽」与「CS43131 ASP 位宽」的**唯一来源**：
+ *   - I2S 必须按该宽度配置（32bit 槽 / Philips）
+ *   - CS43131 的 ASP 常量（SAMPLE_BITS=0x04、CH1=0x07、CH2=0x0F、LCPR=0x3F）
+ *     与之对应，改动任意一侧都会导致「有波形但只有底噪」。
+ * 本板实测只有 32bit 槽可出声，故固定为 32，不做运行期切换。
  */
+#define AUDIO_OUTPUT_SLOT_BITS      32
+
+/** @brief 开机一次性初始化：硬件复位 + 地址探测 + DevId 校验（不开耳放/音频通路） */
 esp_err_t cs43131_init(i2c_master_bus_handle_t i2c_bus);
 
 /**
- * @brief 依据官方寄存器定义重写的完整初始化（v2）：配置 ASP 从模式、
- *        串口位宽、通道使能、耳放与 Class-H，并关闭耳机检测。
+ * @brief 启动播放链路（幂等）：晶振起振 → 切 24.576MHz 直连时钟 → 32bit ASP
+ *        → 耳放 pop-free 上电（PCM 仍保持静音）。采样率切换时重入即可。
  */
-esp_err_t cs43131_init_v2(i2c_master_bus_handle_t i2c_bus, uint32_t sample_rate, uint8_t bits);
+esp_err_t cs43131_start_playback(i2c_master_bus_handle_t i2c_bus, uint32_t sample_rate);
 
-/**
- * @brief 原厂初始化序列复刻（从 OTA 反汇编逐条提取的寄存器写入顺序）。
- *        用于对齐原厂固件真实使用的声音通路配置。
- */
-esp_err_t cs43131_init_vendor(i2c_master_bus_handle_t i2c_bus, uint32_t sample_rate, uint8_t bits);
+/** @brief 解除 PCM 静音（0x090003 ← 0xEC） */
+esp_err_t cs43131_release_mute(void);
 
-/**
- * @brief 依照 AUDIO_CHAIN.md 逆向结果实现的初始化（v4）：
- *        探测 0x30~0x33 + DevId 校验 → 上电 → 晶振起振(清 bit3/bit4,
- *        等 INT_STATUS1.bit3) → 切 24.576MHz 外部时钟 → 原厂 16 项 ASP 表
- *        → 普通耳机耳放档位 (classH=0x20, hp=0x1C)。
- */
-esp_err_t cs43131_init_v4(i2c_master_bus_handle_t i2c_bus, uint32_t sample_rate);
-
-/**
- * @brief ASP 参数扫描：按序号套用一组 (SP_SRATE, ASP_CLOCK_CONF, ASP_FRAME_CONF)。
- *        用于在硬件上自动找出能出声的组合。idx 超范围返回错误。
- */
-esp_err_t cs43131_asp_try(int idx);
-int cs43131_asp_count(void);
-
-/** @brief 时钟源扫描：写 SYS_CLK_CTL_1 候选值并验证 I2C 是否失联（失联自动回退） */
-esp_err_t cs43131_clock_try(int idx);
-int cs43131_clock_count(void);
-
-/** @brief 按采样率/位深配置串口与 ASP（44.1k/16bit 为已确认可用基准档） */
-esp_err_t cs43131_set_stream(uint32_t sample_rate, uint8_t bits);
-
-/**
- * @brief 设置 v2 初始化的探测档位（bit0=用 v4 的 16bit 帧编码，bit1=打开耳机检测，
- *        bit2=切外部 24.576MHz 时钟）。仅用于 bring-up 扫描，默认 0。
- */
-void cs43131_set_probe_profile(int profile);
-
-/**
- * @brief 按音频位宽重新配置 DAC 的串口位宽/通道位宽/ASP 分频
- *        （16bit 用 32bit 帧 DEN=16；24/32bit 用 64bit 帧 DEN=8）
- */
-esp_err_t cs43131_set_word_bits(uint8_t bits);
-
-/**
- * @brief 让音量/静音等旧接口复用 v2 初始化里创建的 I2C 设备句柄
- *        （v2 自己建句柄，不共享会导致音量写入静默失败）
- */
-void cs43131_set_i2c_dev_handle(i2c_master_dev_handle_t dev);
-
-/**
- * @brief 读取 CS43131 芯片 ID（用于验证 I2C 通信）
- * @param[out] id 读到的 ID
- */
-esp_err_t cs43131_read_chip_id(i2c_master_bus_handle_t i2c_bus, uint8_t *id);
-
-/**
- * @brief 设置采样率
- * @param sample_rate 采样率（44100/48000/96000 等）
- */
-esp_err_t cs43131_set_sample_rate(i2c_master_bus_handle_t i2c_bus, uint32_t sample_rate);
-
-/**
- * @brief 设置 PCM 字长，并同步 ASP 槽宽（16 对 16，24/32 对 32）
- */
-esp_err_t cs43131_set_sample_bits(i2c_master_bus_handle_t i2c_bus, uint8_t bits);
-
-/**
- * @brief 设置音量（硬件音量控制）
- * @param volume 0~100
- */
+/** @brief 设置音量 0~100（映射为 PCM 数字衰减，唯一音量入口） */
 esp_err_t cs43131_set_volume(i2c_master_bus_handle_t i2c_bus, uint8_t volume);
 
-/**
- * @brief 静音控制
- */
+/** @brief 静音控制（唯一允许写 PCM_PATH_CTL_1 的接口，保留软斜坡配置位） */
 esp_err_t cs43131_set_mute(i2c_master_bus_handle_t i2c_bus, bool mute);
-
-/**
- * @brief 硬件复位（拉低 GPIO41）
- */
-esp_err_t cs43131_hw_reset(void);
 
 #ifdef __cplusplus
 }
